@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>雨课堂自动答题面板</title>
+<style>
+  :root { --bd:#e2e4ea; --mut:#6b7280; --bg:#f5f6f8; --card:#fff; --blue:#185fa5; --green:#3b6d11; --red:#a32d2d; --amber:#854f0b; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font:14px/1.6 "Segoe UI",system-ui,sans-serif; background:var(--bg); color:#1c1e21; }
+  header { display:flex; align-items:center; gap:12px; padding:12px 20px; background:var(--card); border-bottom:1px solid var(--bd); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:16px; font-weight:600; white-space:nowrap; }
+  .badge { padding:2px 8px; border-radius:8px; font-size:12px; border:1px solid var(--bd); background:#f1f2f5; color:var(--mut); white-space:nowrap; }
+  .badge.ok { background:#eaf3de; color:var(--green); border-color:#c0dd97; }
+  .badge.live { background:#e6f1fb; color:var(--blue); border-color:#b5d4f4; }
+  .badge.warn { background:#faeeda; color:var(--amber); border-color:#fac775; }
+  .badge.err { background:#fcebeb; color:var(--red); border-color:#f7c1c1; }
+  .spacer { flex:1; }
+  button { font:inherit; min-height:34px; padding:6px 14px; border-radius:6px; border:1px solid var(--bd); background:var(--card); cursor:pointer; }
+  button:hover { border-color:var(--blue); color:var(--blue); }
+  button:disabled { cursor:not-allowed; opacity:.55; }
+  button.primary { background:var(--blue); border-color:var(--blue); color:#fff; }
+  button.primary:hover { opacity:.9; color:#fff; }
+  button.danger { background:var(--red); border-color:var(--red); color:#fff; }
+  main { display:grid; grid-template-columns:320px minmax(0,1fr); gap:14px; padding:14px 20px; max-width:1280px; margin:0 auto; }
+  .col { display:flex; flex-direction:column; gap:14px; min-width:0; }
+  .card { background:var(--card); border:1px solid var(--bd); border-radius:8px; padding:14px; }
+  .card h2 { font-size:13px; font-weight:600; color:var(--mut); margin-bottom:10px; }
+  .kv { display:flex; justify-content:space-between; gap:12px; padding:3px 0; font-size:13px; }
+  .kv b { font-weight:500; text-align:right; overflow-wrap:anywhere; }
+  #qrImg { width:200px; height:200px; display:block; margin:6px auto; border:1px solid var(--bd); border-radius:6px; background:#fafafa; object-fit:contain; }
+  .hint { font-size:12px; color:var(--mut); text-align:center; }
+  label.switch { display:flex; align-items:center; gap:8px; font-size:13px; padding:6px 0; cursor:pointer; }
+  .row { display:flex; gap:8px; }
+  .card h2.form-heading { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  .field { display:grid; gap:4px; margin-top:9px; color:var(--mut); font-size:12px; }
+  .field input, .field select { width:100%; min-width:0; height:34px; padding:6px 9px; border:1px solid var(--bd); border-radius:6px; background:#fff; color:#1c1e21; font:13px/1.4 "Segoe UI",system-ui,sans-serif; }
+  .field input:focus, .field select:focus { border-color:var(--blue); outline:2px solid #d8e8f7; }
+  .field input::placeholder { color:#9aa0aa; }
+  .model-picker { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; }
+  .model-picker button { white-space:nowrap; }
+  .form-message { min-height:19px; margin-top:6px; text-align:left; }
+  .account-list { display:grid; gap:0; }
+  .account-row { padding:10px 0; border-top:1px solid var(--bd); }
+  .account-row:first-child { padding-top:0; border-top:0; }
+  .account-head { display:flex; align-items:center; gap:8px; min-width:0; }
+  .account-name { flex:1; min-width:0; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .account-meta { margin-top:4px; color:var(--mut); font-size:12px; overflow-wrap:anywhere; }
+  .account-stats { display:flex; gap:12px; margin-top:4px; color:var(--mut); font-size:12px; }
+  .account-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .account-actions button { min-height:30px; padding:4px 10px; font-size:12px; }
+  .empty { padding:8px 0; color:var(--mut); font-size:12px; text-align:center; }
+  #log { height:clamp(420px,calc(100vh - 150px),720px); overflow-y:auto; background:#14161a; color:#c9d1d9; font:12px/1.7 Consolas,monospace; border-radius:6px; padding:10px 12px; white-space:pre-wrap; word-break:break-all; }
+  #log .warn { color:#e3b341; } #log .error { color:#f85149; } #log .debug { color:#8b949e; }
+  .stats { display:flex; gap:18px; font-size:13px; color:var(--mut); white-space:nowrap; }
+  .stats b { color:#1c1e21; font-weight:500; }
+  @media (max-width:900px) {
+    header { flex-wrap:wrap; padding:10px 14px; }
+    header .spacer { display:none; }
+    header .stats { order:3; width:100%; }
+    main { grid-template-columns:1fr; padding:12px; }
+    #log { height:320px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>雨课堂答题面板</h1>
+  <span id="loginBadge" class="badge">0 个账号</span>
+  <span id="phaseBadge" class="badge">未启动</span>
+  <div class="spacer"></div>
+  <div class="stats">已缓存 <b id="stProblems">0</b> 题 · 已答 <b id="stAnswered">0</b> 题</div>
+  <button id="btnWatch" class="primary" disabled>全部开始</button>
+  <button id="btnStop" class="danger" style="display:none">全部停止</button>
+</header>
+
+<main>
+  <div class="col">
+    <section class="card">
+      <h2 class="form-heading"><span>账号</span><span id="accountCount" class="badge">0</span></h2>
+      <div id="accountList" class="account-list"></div>
+      <div id="emptyAccounts" class="empty">尚未添加账号</div>
+      <img id="qrImg" alt="登录二维码" referrerpolicy="no-referrer" style="display:none">
+      <div class="hint" id="qrHint">未登录</div>
+      <div class="row" style="margin-top:10px">
+        <button id="btnQr" class="primary" style="flex:1">添加账号</button>
+        <button id="btnLogout" style="display:none">全部退出</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>监课控制</h2>
+      <label class="switch"><input type="checkbox" id="autoAnswer"> 自动答题并提交</label>
+      <label class="switch"><input type="checkbox" id="autoStart"> 登录后自动开始监课</label>
+      <div style="border-top:1px solid var(--bd);margin:6px 0"></div>
+      <div class="kv"><span>签到方式</span><b>雨课堂 App 手动签到</b></div>
+    </section>
+
+    <section class="card">
+      <h2 class="form-heading"><span>模型配置</span><span id="llmKeyBadge" class="badge">未配置</span></h2>
+      <form id="llmForm" autocomplete="off">
+        <label class="field"><span>API 地址</span><input id="llmBaseUrl" type="url" maxlength="2048" spellcheck="false" required></label>
+        <label class="field"><span>API Key</span><input id="llmApiKey" type="password" maxlength="8192" autocomplete="off"></label>
+        <div class="field"><label for="llmModel">模型</label><div class="model-picker"><select id="llmModel" required></select><button id="btnFetchModels" type="button">获取模型</button></div></div>
+        <label class="switch"><input type="checkbox" id="llmVision"> 图片输入</label>
+        <button id="btnSaveLlm" class="primary" type="submit" style="width:100%;margin-top:10px">保存模型配置</button>
+        <div id="llmHint" class="hint form-message"></div>
+      </form>
+    </section>
+
+  </div>
+
+  <div class="col">
+    <section class="card" style="flex:1;display:flex;flex-direction:column">
+      <h2>实时日志</h2>
+      <div id="log"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let ws = null;
+let wsTimer = null;
+let qrController = null;
+let qrAttemptId = null;
+let accountStates = new Map();
+let llmFormInitialized = false;
+let llmFormDirty = false;
+let llmModels = [];
+
+function addLog(text, level, accountName) {
+  const log = $("log");
+  const line = document.createElement("div");
+  if (level) line.className = level;
+  const prefix = accountName ? "[" + accountName + "] " : "";
+  line.textContent = "[" + new Date().toLocaleTimeString("zh-CN", {hour12:false}) + "] " + prefix + text;
+  log.appendChild(line);
+  while (log.childNodes.length > 400) log.removeChild(log.firstChild);
+  log.scrollTop = log.scrollHeight;
+}
+
+function setBadge(element, text, style) {
+  element.textContent = text;
+  element.className = "badge " + (style || "");
+}
+
+function setModelOptions(models, selected) {
+  const select = $("llmModel");
+  const values = [...new Set((models || []).filter(value => typeof value === "string" && value))];
+  select.replaceChildren();
+  if (!values.length) {
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "请先获取模型";
+    select.appendChild(placeholder);
+  }
+  for (const value of values) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    select.appendChild(option);
+  }
+  llmModels = values;
+  if (selected && values.includes(selected)) select.value = selected;
+  select.disabled = !values.length;
+  $("btnSaveLlm").disabled = !values.length;
+}
+
+function applyLlmState(settings) {
+  if (!settings) return;
+  const configured = !!settings.api_key_configured;
+  setBadge($("llmKeyBadge"), configured ? "已配置" : "未配置", configured ? "ok" : "warn");
+  const keyInput = $("llmApiKey");
+  keyInput.placeholder = configured ? "已配置，留空保持不变" : "请输入 API Key";
+  if (!llmFormInitialized || !llmFormDirty) {
+    $("llmBaseUrl").value = settings.base_url || "";
+    const available = llmModels.length ? llmModels : [settings.model].filter(Boolean);
+    setModelOptions(available, settings.model || "");
+    $("llmVision").checked = !!settings.vision_enabled;
+    keyInput.value = "";
+    llmFormInitialized = true;
+  }
+}
+
+async function requestJSON(url, options) {
+  const response = await fetch(url, options);
+  let data = {};
+  try { data = await response.json(); } catch (error) {}
+  if (!response.ok) throw new Error(data.message || ("请求失败 HTTP " + response.status));
+  return data;
+}
+
+function applyState(state) {
+  const accounts = Array.isArray(state.accounts) ? state.accounts : (state.logged_in ? [{
+    account_id:"single", user_id:state.user_id, user_name:state.user_name,
+    logged_in:state.logged_in, session_saved:state.session_saved, watching:state.watching,
+    phase:state.phase, detail:state.detail, lesson_id:state.lesson_id,
+    course_name:state.course_name, problems:state.problems, answered:state.answered
+  }] : []);
+  renderAccounts(accounts);
+  $("stProblems").textContent = state.problems || 0;
+  $("stAnswered").textContent = state.answered || 0;
+  $("autoAnswer").checked = !!state.auto_answer;
+  $("autoStart").checked = !!state.auto_start_watching;
+  applyLlmState(state.llm);
+  const active = accounts.filter(account => account.logged_in);
+  const watching = active.filter(account => account.watching);
+  const inClass = active.filter(account => account.phase === "in_class");
+  setBadge($("loginBadge"), active.length + " 个账号", active.length ? "ok" : "");
+  if (inClass.length) setBadge($("phaseBadge"), inClass.length + " 个课堂中", "live");
+  else if (active.some(account => account.phase === "error")) setBadge($("phaseBadge"), "存在异常", "err");
+  else if (watching.length) setBadge($("phaseBadge"), watching.length + " 个监课中", "warn");
+  else setBadge($("phaseBadge"), "未启动", "");
+  $("btnWatch").style.display = active.some(account => !account.watching) ? "" : "none";
+  $("btnStop").style.display = watching.length ? "" : "none";
+  $("btnWatch").disabled = !active.length;
+  $("btnLogout").style.display = accounts.length ? "" : "none";
+  if (!qrController) $("qrHint").textContent = active.length ? "可继续添加账号" : "尚未登录";
+}
+
+const phaseNames = {idle:"已停止", waiting:"等待课程", waiting_checkin:"等待签到", in_class:"课堂中", reconnecting:"正在重连", error:"异常", expired:"登录失效"};
+
+function actionButton(label, action, style) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.dataset.action = action;
+  if (style) button.className = style;
+  return button;
+}
+
+function renderAccounts(accounts) {
+  accountStates = new Map(accounts.map(account => [String(account.account_id), account]));
+  const list = $("accountList");
+  list.replaceChildren();
+  for (const account of accounts) {
+    const accountId = String(account.account_id);
+    const row = document.createElement("div");
+    row.className = "account-row";
+    row.dataset.accountId = accountId;
+    const head = document.createElement("div");
+    head.className = "account-head";
+    const name = document.createElement("span");
+    name.className = "account-name";
+    name.textContent = account.user_name || account.user_id || "未命名账号";
+    const badge = document.createElement("span");
+    setBadge(badge, phaseNames[account.phase] || account.phase || "未知",
+             account.phase === "in_class" ? "live" : (account.phase === "error" || account.phase === "expired" ? "err" : (account.watching ? "warn" : "")));
+    head.append(name, badge);
+    const meta = document.createElement("div");
+    meta.className = "account-meta";
+    meta.textContent = account.course_name ? account.course_name + " · " + (account.detail || "") : (account.detail || "-");
+    const stats = document.createElement("div");
+    stats.className = "account-stats";
+    stats.textContent = "缓存 " + (account.problems || 0) + " 题 · 已答 " + (account.answered || 0) + " 题";
+    const actions = document.createElement("div");
+    actions.className = "account-actions";
+    if (account.logged_in) {
+      actions.append(actionButton(account.watching ? "停止" : "开始", account.watching ? "stop" : "start"));
+      if (account.phase === "waiting_checkin") actions.append(actionButton("检测签到", "join", "primary"));
+    } else {
+      actions.append(actionButton("重新登录", "relogin", "primary"));
+    }
+    actions.append(actionButton("移除", "remove"));
+    row.append(head, meta, stats, actions);
+    list.appendChild(row);
+  }
+  $("emptyAccounts").style.display = accounts.length ? "none" : "";
+  setBadge($("accountCount"), String(accounts.length), accounts.length ? "ok" : "");
+}
+
+function accountName(accountId, fallback) {
+  const account = accountStates.get(String(accountId));
+  return fallback || (account && (account.user_name || account.user_id)) || "账号";
+}
+
+function connectWs() {
+  clearTimeout(wsTimer);
+  if (ws) { try { ws.close(); } catch (error) {} }
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.onopen = () => addLog("已连接面板通道");
+  ws.onmessage = event => {
+    let message;
+    try { message = JSON.parse(event.data); } catch (error) { return; }
+    if (message.kind === "log") addLog(message.text, message.level, message.account_name);
+    else if (message.kind === "state") applyState(message);
+    else if (message.kind === "login") {
+      if (message.attempt_id != null && message.attempt_id !== qrAttemptId) return;
+      if (message.status === "ok") {
+        addLog((message.created === false ? "账号已存在 " : "账号已添加 ") + (message.user_name || message.user_id));
+        $("qrHint").textContent = message.created === false ? "该账号已添加" : "账号添加成功";
+        $("qrImg").style.display = "none";
+        $("btnQr").textContent = "添加账号";
+        stopQrPoll();
+        refreshState();
+      } else if (message.status === "logged_out" || message.status === "removed") {
+        stopQrPoll();
+        refreshState();
+      } else {
+        addLog("登录失败: " + message.message, "error");
+        $("qrHint").textContent = "登录失败: " + message.message;
+        stopQrPoll();
+      }
+    }
+  };
+  ws.onclose = () => {
+    addLog("面板通道断开，3s 后重连", "warn");
+    wsTimer = setTimeout(connectWs, 3000);
+  };
+}
+
+async function refreshState() {
+  try { applyState(await requestJSON("/api/state")); } catch (error) {}
+}
+
+function stopQrPoll() {
+  if (qrController) qrController.abort();
+  qrController = null;
+  qrAttemptId = null;
+  $("btnQr").disabled = false;
+}
+
+async function qrStart() {
+  stopQrPoll();
+  let restartQr = false;
+  const image = $("qrImg");
+  image.onload = null;
+  image.onerror = null;
+  image.removeAttribute("src");
+  const controller = new AbortController();
+  qrController = controller;
+  $("btnQr").disabled = true;
+  $("qrImg").style.display = "none";
+  $("qrHint").textContent = "正在生成二维码";
+  try {
+    const result = await requestJSON("/api/login/qr/start", {method:"POST", signal:controller.signal});
+    if (qrController !== controller) return;
+    if (!result.token || !(result.qr_image || result.qr_dataurl)) throw new Error("二维码响应不完整");
+    qrAttemptId = result.attempt_id;
+    const scanHint = result.scan_app === "wechat" ? "请使用微信扫码登录" : "请使用雨课堂 App 扫码登录";
+    image.onload = () => {
+      if (qrController !== controller) return;
+      image.style.display = "";
+      $("qrHint").textContent = scanHint;
+    };
+    image.onerror = () => {
+      if (qrController !== controller) return;
+      image.style.display = "none";
+      $("qrHint").textContent = "二维码图片加载失败，请重新生成";
+      stopQrPoll();
+    };
+    image.src = result.qr_image || result.qr_dataurl;
+    $("btnQr").disabled = false;
+    $("btnQr").textContent = "重新生成";
+    while (qrController === controller && !controller.signal.aborted) {
+      const poll = await requestJSON("/api/login/qr/poll", {
+        method:"POST", signal:controller.signal,
+        headers:{"content-type":"application/json"},
+        body:JSON.stringify({token:result.token, attempt_id:result.attempt_id})
+      });
+      if (poll.status === "ok") {
+        image.style.display = "none";
+        $("qrHint").textContent = poll.created === false ? "该账号已添加" : "账号添加成功";
+        $("btnQr").textContent = "添加账号";
+        await refreshState();
+        stopQrPoll();
+        break;
+      }
+      if (poll.status === "refresh") {
+        restartQr = true;
+        $("qrHint").textContent = poll.message || "二维码已过期，正在自动刷新";
+        addLog(poll.message || "二维码已过期，正在自动刷新");
+        break;
+      }
+      if (poll.status !== "pending") throw new Error(poll.message || "二维码状态异常");
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
+  } catch (error) {
+    if (qrController === controller && error.name !== "AbortError") {
+      $("qrHint").textContent = "二维码登录失败: " + error.message;
+      addLog("二维码登录失败: " + error.message, "error");
+    }
+  } finally {
+    if (qrController === controller) {
+      qrController = null;
+      qrAttemptId = null;
+      $("btnQr").disabled = false;
+      if (restartQr) void qrStart();
+    }
+  }
+}
+
+async function watchStart() {
+  try {
+    await requestJSON("/api/watch/start", {method:"POST"});
+    await refreshState();
+  } catch (error) { addLog("启动失败: " + error.message, "error"); }
+}
+
+$("btnQr").onclick = qrStart;
+$("btnWatch").onclick = watchStart;
+$("btnStop").onclick = async () => {
+  try { await requestJSON("/api/watch/stop", {method:"POST"}); await refreshState(); }
+  catch (error) { addLog("停止失败: " + error.message, "error"); }
+};
+$("accountList").onclick = async event => {
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+  const row = button.closest(".account-row");
+  const accountId = row && row.dataset.accountId;
+  const action = button.dataset.action;
+  if (!accountId) return;
+  if (action === "relogin") {
+    void qrStart();
+    return;
+  }
+  if (action === "remove" && !window.confirm("移除该账号并删除其本地登录会话？")) return;
+  button.disabled = true;
+  try {
+    const path = action === "remove"
+      ? "/api/accounts/" + encodeURIComponent(accountId) + "/remove"
+      : "/api/accounts/" + encodeURIComponent(accountId) + "/watch/" + action;
+    const result = await requestJSON(path, {
+      method:"POST", headers:{"content-type":"application/json"}, body:"{}"
+    });
+    if (action === "join") addLog("已检测签到，正在接入课堂 " + (result.lesson_id || ""), "", accountName(accountId));
+    await refreshState();
+  } catch (error) {
+    addLog("账号操作失败: " + error.message, "error", accountName(accountId));
+  } finally {
+    button.disabled = false;
+  }
+};
+$("autoAnswer").onchange = async event => {
+  const enabled = event.target.checked;
+  if (enabled && !window.confirm("开启后会自动选择并向雨课堂提交答案。确认继续？")) {
+    event.target.checked = false;
+    return;
+  }
+  try {
+    await requestJSON("/api/config", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({auto_answer:enabled})});
+    addLog(enabled ? "自动答题已开启，将自动提交答案" : "自动答题已关闭，仅显示建议答案", enabled ? "warn" : "");
+  } catch (error) {
+    event.target.checked = !enabled;
+    addLog("配置保存失败: " + error.message, "error");
+  }
+};
+$("autoStart").onchange = async event => {
+  const enabled = event.target.checked;
+  try {
+    await requestJSON("/api/config", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({auto_start_watching:enabled})});
+  } catch (error) {
+    event.target.checked = !enabled;
+    addLog("配置保存失败: " + error.message, "error");
+  }
+};
+for (const id of ["llmBaseUrl", "llmApiKey"]) {
+  $(id).oninput = () => {
+    llmFormDirty = true;
+    $("llmVision").checked = false;
+    setModelOptions([], "");
+    $("llmHint").textContent = "请重新获取模型";
+  };
+}
+$("llmModel").onchange = () => {
+  llmFormDirty = true;
+  $("llmVision").checked = false;
+  $("llmHint").textContent = "";
+};
+$("llmVision").onchange = () => {
+  llmFormDirty = true;
+  $("llmHint").textContent = "";
+};
+$("btnFetchModels").onclick = async () => {
+  const button = $("btnFetchModels");
+  const hint = $("llmHint");
+  const controls = [$("llmBaseUrl"), $("llmApiKey"), $("llmModel"), $("llmVision"),
+                    $("btnSaveLlm"), button];
+  const payload = {base_url: $("llmBaseUrl").value.trim()};
+  const apiKey = $("llmApiKey").value.trim();
+  if (apiKey) payload.api_key = apiKey;
+  llmFormDirty = true;
+  for (const control of controls) control.disabled = true;
+  hint.textContent = "正在获取模型";
+  try {
+    const result = await requestJSON("/api/config/llm/models", {
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify(payload)
+    });
+    const previous = $("llmModel").value;
+    setModelOptions(result.models, previous);
+    if ($("llmModel").value !== previous) $("llmVision").checked = false;
+    llmFormDirty = true;
+    hint.textContent = "已获取 " + result.models.length + " 个模型";
+  } catch (error) {
+    hint.textContent = error.message;
+    addLog("获取模型失败: " + error.message, "error");
+  } finally {
+    $("llmBaseUrl").disabled = false;
+    $("llmApiKey").disabled = false;
+    $("llmVision").disabled = false;
+    button.disabled = false;
+    $("llmModel").disabled = !llmModels.length;
+    $("btnSaveLlm").disabled = !llmModels.length;
+  }
+};
+$("llmForm").onsubmit = async event => {
+  event.preventDefault();
+  const button = $("btnSaveLlm");
+  const hint = $("llmHint");
+  const llm = {
+    base_url: $("llmBaseUrl").value.trim(),
+    model: $("llmModel").value.trim(),
+    vision_enabled: $("llmVision").checked
+  };
+  const apiKey = $("llmApiKey").value.trim();
+  if (apiKey) llm.api_key = apiKey;
+  button.disabled = true;
+  hint.textContent = "正在保存";
+  try {
+    const result = await requestJSON("/api/config", {
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({llm})
+    });
+    llmFormDirty = false;
+    applyLlmState(result.llm);
+    hint.textContent = "已保存";
+    addLog("模型配置已保存");
+  } catch (error) {
+    hint.textContent = error.message;
+    addLog("模型配置保存失败: " + error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+};
+$("btnLogout").onclick = async () => {
+  if (!window.confirm("退出全部账号并删除所有本地登录会话？")) return;
+  try {
+    await requestJSON("/api/logout", {method:"POST"});
+    $("btnQr").textContent = "添加账号";
+    await refreshState();
+  } catch (error) { addLog("退出失败: " + error.message, "error"); }
+};
+
+connectWs();
+refreshState();
+setInterval(refreshState, 5000);
+</script>
+</body>
+</html>

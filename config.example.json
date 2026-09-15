@@ -1,0 +1,20 @@
+{
+  "server": "yuketang",
+  "llm": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "YOUR_API_KEY",
+    "model": "YOUR_MODEL_ID",
+    "vision_enabled": false
+  },
+  "lesson": {
+    "poll_interval": 3
+  },
+  "bot": {
+    "dry_run": true,
+    "wait_manual_checkin": true,
+    "auto_start_watching": false,
+    "answer_delay_seconds": 5,
+    "safety_seconds": 8,
+    "request_margin_seconds": 1.5
+  }
+}
