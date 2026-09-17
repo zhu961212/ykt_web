@@ -73,15 +73,53 @@ cp config.example.json config.json
 
 ### Linux 服务器部署
 
-在支持 systemd 的 Linux 服务器上执行：
+有公网域名时，推荐让部署脚本同时配置 Caddy 和 HTTPS。开始前先完成以下准备：
+
+- 将域名的 `A` 记录指向服务器公网 IPv4；只有服务器确实可通过 IPv6 访问时才保留 `AAAA` 记录
+- 在云安全组和服务器防火墙中放行 TCP `80`、`443`
+- 确认没有其他 Web 服务占用 `80`、`443`；已有 Nginx、Apache 或 Caddy 的服务器应改用下文的“已有反向代理”方式
+- 确认服务器可以访问软件源和公开证书签发服务；如果系统软件源不提供 Caddy，请先按 Caddy 官方文档安装
+
+随后在支持 systemd 的 Linux 服务器上执行。`--domain` 只填写域名，不要包含 `https://`、端口或路径：
 
 ```bash
 git clone https://github.com/zhu961212/ykt_web.git
 cd ykt_web
+sudo bash scripts/deploy.sh --domain panel.example.com
+```
+
+域名模式会安装并配置 Caddy，由 Caddy 监听公网 `80/443`、申请并自动续期证书，再将 HTTP 和 WebSocket 请求转发到 `127.0.0.1:8765`。Python 服务仍以非 root 账号运行，不会直接监听特权端口 `443`；部署器还会自动启用安全 Cookie 和本机反向代理信任。完成后访问 `https://panel.example.com/`，无需附加端口。首次签发证书可能需要短暂等待。
+
+不要把应用的 `--port` 设置为 `443`。公网只需开放 `80/443`，不应开放后端端口 `8765`。手机浏览器的摄像头扫码要求 HTTPS，因此公网扫码页也应使用上述域名地址。
+
+如果暂时没有域名，并且只在可信内网中使用，可以不传 `--domain`：
+
+```bash
 sudo bash scripts/deploy.sh
 ```
 
-部署器会创建独立服务账号、虚拟环境和 systemd 服务，默认监听 `0.0.0.0:8765`，并生成管理员账号与强随机密码。部署完成后可直接打开 `http://服务器IP:8765`，或将域名解析到该服务器后访问 `http://域名:8765`。首次凭据保存在仅 root 可读的 `/opt/ykt-web/admin/service.env`，更新不会覆盖。
+此模式默认监听 `0.0.0.0:8765`，通过 `http://服务器IP:8765` 访问，不提供传输加密，也不能满足手机浏览器的摄像头安全要求，不建议直接暴露到公网。
+
+两种模式都会创建独立服务账号、虚拟环境和 systemd 服务，并生成管理员账号与强随机密码。首次凭据保存在仅 root 可读的 `/opt/ykt-web/admin/service.env`，更新不会覆盖。
+
+#### 现有部署启用 HTTPS
+
+已经使用旧版脚本部署的服务器，需要先完成一次普通更新，让服务器取得支持 `--domain` 的新版部署器，再配置域名：
+
+```bash
+sudo /opt/ykt-web/admin/update.sh
+sudo /opt/ykt-web/admin/deploy.sh --domain panel.example.com
+```
+
+旧版部署器不认识 `--domain`，因此不要把域名参数加到第一次更新命令中。第二条命令只需配置现有版本，不要求使用 `--force`，并会保留账号、模型配置、登录状态和管理员凭据。完成迁移后，应从云安全组和服务器防火墙中关闭原先对公网开放的 `8765`。
+
+需要停用安装器管理的 HTTPS 并恢复直接端口访问时执行：
+
+```bash
+sudo /opt/ykt-web/admin/deploy.sh --no-domain
+```
+
+该命令只移除本项目管理的 Caddy 站点，不会删除 Caddy 或改动其他站点；随后应按实际网络边界重新配置防火墙。
 
 登录后可在“设置 -> 管理员密码”直接设置新密码，无需再次输入旧密码；为降低会话被盗风险，改密要求管理员在最近 10 分钟内登录。新密码需为 12-256 个可见字符，支持常见符号、空格和中文。密码使用随机盐 PBKDF2 哈希保存，修改后所有旧管理会话和 WebSocket 立即失效。`service.env` 中的密码仅作为首次部署和紧急恢复凭据。
 
@@ -100,7 +138,22 @@ YKT_ADMIN_USERNAME=admin YKT_ADMIN_PASSWORD='StrongPass_2026' \
 python server.py
 ```
 
-公网域名应在服务前配置 HTTPS 反向代理，并限制防火墙只开放需要的端口。反向代理与服务位于同一主机时，在 `service.env` 同时设置 `YKT_SECURE_COOKIE=1` 和 `YKT_TRUST_PROXY=1`，传递 `X-Forwarded-Proto`、`X-Forwarded-Host`，并让 `X-Forwarded-For` 的最后一项为代理实际看到的客户端 IP，然后重启服务。程序只信任来自本机回环地址的这些代理头。
+如果服务器已有统一管理的 Nginx、Caddy 或其他 HTTPS 入口，请不要让自动部署覆盖其站点配置。应让 ykt_web 只监听回环地址，并由现有代理转发请求；在 `service.env` 同时设置 `YKT_SECURE_COOKIE=1` 和 `YKT_TRUST_PROXY=1`，传递 `X-Forwarded-Proto`、`X-Forwarded-Host`，并让 `X-Forwarded-For` 的最后一项为代理实际看到的客户端 IP，然后重启服务。程序只信任来自本机回环地址的这些代理头。
+
+#### HTTPS 排障
+
+先确认 DNS、端口监听和两个服务的状态：
+
+```bash
+getent ahosts panel.example.com
+sudo ss -lntp | grep -E ':(80|443|8765)\b'
+sudo systemctl status ykt-web caddy --no-pager
+sudo journalctl -u caddy -n 100 --no-pager
+curl -fsS http://127.0.0.1:8765/api/health
+curl -I https://panel.example.com/
+```
+
+后端健康检查成功但 HTTPS 仍失败时，通常是域名尚未解析到当前服务器、不可达的 `AAAA` 记录、云安全组或防火墙未放行 `80/443`，或者端口已被其他服务占用。证书签发依赖公网能够通过域名访问服务器，单纯把域名解析到 IP 并不会绕过这些条件。
 
 ### 检查与安装更新
 
@@ -117,6 +170,8 @@ sudo /opt/ykt-web/admin/update.sh
 ```
 
 候选版本会先在隔离目录安装依赖并运行编译和测试，随后才切换服务；`config.json`、`session.json`、`logs/` 和管理员凭据会保留。启动或健康检查失败时自动恢复上一版本，成功后只保留最近 1 个完整回滚版本。
+
+通过 `--domain` 配置的域名会保存在部署元数据中。以后正常执行 `update.sh` 无需再次传入域名，更新后仍使用原来的 HTTPS 地址；证书申请和续期由 Caddy 独立管理。`--check` 只检查项目版本，不会重新配置代理或申请证书。
 
 ## 使用
 

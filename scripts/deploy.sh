@@ -45,6 +45,8 @@ Options:
   --python COMMAND     Python 3.10+ executable (default: python3)
   --host ADDRESS       Listen address (default: 0.0.0.0)
   --port PORT          Listen port (default: 8765)
+  --domain HOSTNAME    Enable automatic HTTPS for this domain with Caddy
+  --no-domain          Disable the managed HTTPS proxy
   --admin-user USER    Web administrator username (default: admin)
   --check              Fetch and report update status without deploying
   --skip-tests         Run import/compile checks, but skip the unit test suite
@@ -64,6 +66,27 @@ require_option_value() {
     local option="$1"
     local value="${2-}"
     [[ -n "$value" ]] || die "$option requires a value"
+}
+
+validate_domain() {
+    local label final_label
+    local -a labels=()
+    DOMAIN="${DOMAIN%.}"
+    DOMAIN="${DOMAIN,,}"
+    [[ -n "$DOMAIN" && ${#DOMAIN} -le 253 ]] || die "--domain must be 1-253 characters"
+    [[ "$DOMAIN" == *.* && "$DOMAIN" != *..* ]] || \
+        die "--domain must be a fully qualified hostname such as panel.example.com"
+    [[ "$DOMAIN" != *[[:space:]]* ]] || die "--domain must not contain whitespace"
+    [[ "$DOMAIN" =~ ^[a-z0-9.-]+$ ]] || \
+        die "--domain accepts an ASCII hostname only; do not include a scheme, port, or path"
+    [[ ! "$DOMAIN" =~ ^[0-9.]+$ ]] || die "--domain must not be an IP address"
+    IFS='.' read -r -a labels <<< "$DOMAIN"
+    for label in "${labels[@]}"; do
+        [[ ${#label} -le 63 && "$label" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || \
+            die "--domain contains an invalid DNS label: $label"
+    done
+    final_label="${labels[${#labels[@]}-1]}"
+    [[ "$final_label" =~ [a-z] ]] || die "--domain must end in a valid public DNS suffix"
 }
 
 SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
@@ -91,6 +114,7 @@ SERVICE_NAME="${YKT_SERVICE_NAME:-}"
 PYTHON_COMMAND="${YKT_PYTHON:-}"
 BIND_HOST="${YKT_HOST:-}"
 BIND_PORT="${YKT_PORT:-}"
+DOMAIN="${YKT_DOMAIN:-}"
 ADMIN_USERNAME="${YKT_ADMIN_USERNAME:-}"
 [[ -z "${YKT_ADMIN_PASSWORD:-}" ]] || \
     die "do not pass YKT_ADMIN_PASSWORD to deploy.sh; it generates a password and stores it in service.env"
@@ -102,6 +126,9 @@ RUN_TESTS=1
 FORCE_DEPLOY=0
 CHECK_ONLY=0
 UPDATE_MODE=0
+DISABLE_DOMAIN=0
+DOMAIN_ENABLE_SEEN=0
+DOMAIN_DISABLE_SEEN=0
 
 repo_explicit=0
 ref_explicit=0
@@ -110,6 +137,7 @@ service_explicit=0
 python_explicit=0
 host_explicit=0
 port_explicit=0
+domain_explicit=0
 admin_user_explicit=0
 secure_cookie_explicit=0
 trust_proxy_explicit=0
@@ -121,6 +149,7 @@ admin_reset_explicit=0
 [[ -n "$PYTHON_COMMAND" ]] && python_explicit=1
 [[ -n "$BIND_HOST" ]] && host_explicit=1
 [[ -n "$BIND_PORT" ]] && port_explicit=1
+[[ -n "$DOMAIN" ]] && domain_explicit=1
 [[ -n "$ADMIN_USERNAME" ]] && admin_user_explicit=1
 [[ -n "$SECURE_COOKIE" ]] && secure_cookie_explicit=1
 [[ -n "$TRUST_PROXY" ]] && trust_proxy_explicit=1
@@ -186,6 +215,25 @@ while (( index < ${#args[@]} )); do
             port_explicit=1
             ;;
         --port=*) BIND_PORT="${argument#*=}"; port_explicit=1 ;;
+        --domain)
+            ((index += 1))
+            require_option_value "$argument" "${args[$index]-}"
+            DOMAIN="${args[$index]}"
+            DOMAIN_ENABLE_SEEN=1
+            domain_explicit=1
+            ;;
+        --domain=*)
+            DOMAIN="${argument#*=}"
+            require_option_value "--domain" "$DOMAIN"
+            DOMAIN_ENABLE_SEEN=1
+            domain_explicit=1
+            ;;
+        --no-domain)
+            DOMAIN=""
+            DISABLE_DOMAIN=1
+            DOMAIN_DISABLE_SEEN=1
+            domain_explicit=1
+            ;;
         --admin-user)
             ((index += 1))
             require_option_value "$argument" "${args[$index]-}"
@@ -202,6 +250,9 @@ while (( index < ${#args[@]} )); do
     esac
     ((index += 1))
 done
+
+(( DOMAIN_ENABLE_SEEN == 0 || DOMAIN_DISABLE_SEEN == 0 )) || \
+    die "--domain and --no-domain cannot be used together"
 
 [[ "$INSTALL_DIR" == /* ]] || die "--install-dir must be an absolute path"
 [[ "$INSTALL_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "--install-dir contains unsupported characters"
@@ -269,6 +320,11 @@ UNIT_CHANGED=0
 ADMIN_METADATA_BACKUP="$ADMIN_DIR/.metadata.rollback.$$"
 ADMIN_METADATA_CHANGED=0
 PASSWORD_GENERATED=0
+CADDY_BACKUP_DIR="$ADMIN_DIR/.caddy.rollback.$$"
+CADDY_TRANSACTION_ACTIVE=0
+CADDY_CONFIG_CHANGED=0
+CADDY_WAS_ACTIVE=0
+CADDY_WAS_ENABLED=0
 
 install -d -m 0700 -- "$ADMIN_DIR" "$REPOSITORY_DIR" "$BACKUP_ROOT" "$FAILED_ROOT"
 # Build children are private, while the service user needs execute-only traversal.
@@ -282,6 +338,7 @@ saved_deploy_ref=""
 saved_service_user=""
 saved_service_name=""
 saved_python_command=""
+saved_domain=""
 
 if [[ -f "$DEPLOY_CONFIG" ]]; then
     config_owner="$(stat -c '%u' -- "$DEPLOY_CONFIG")"
@@ -296,6 +353,7 @@ if [[ -f "$DEPLOY_CONFIG" ]]; then
             SERVICE_USER) saved_service_user="$value" ;;
             SERVICE_NAME) saved_service_name="$value" ;;
             PYTHON_COMMAND) saved_python_command="$value" ;;
+            DOMAIN) saved_domain="$value" ;;
         esac
     done < "$DEPLOY_CONFIG"
 fi
@@ -315,6 +373,12 @@ fi
 if (( python_explicit == 0 )); then
     PYTHON_COMMAND="${saved_python_command:-python3}"
 fi
+if (( domain_explicit == 0 )); then
+    DOMAIN="$saved_domain"
+fi
+if [[ -n "$DOMAIN" ]]; then
+    validate_domain
+fi
 
 if [[ -d "$APP_DIR" && -n "$saved_service_user" && "$SERVICE_USER" != "$saved_service_user" ]]; then
     die "changing the service user on an existing deployment is not supported"
@@ -333,6 +397,12 @@ BUILD_USER="${SERVICE_USER%\$}-build"
     die "derived build user is invalid; choose a shorter --user value"
 [[ "$SERVICE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]*$ ]] || die "invalid service name: $SERVICE_NAME"
 [[ "$PYTHON_COMMAND" != *$'\n'* && "$PYTHON_COMMAND" != *$'\r'* ]] || die "invalid Python command"
+if [[ -n "$DOMAIN" && $host_explicit -eq 1 && "$BIND_HOST" != "127.0.0.1" ]]; then
+    die "--domain manages the public listener and only supports --host 127.0.0.1"
+fi
+if [[ -n "$DOMAIN" && $port_explicit -eq 1 && "$BIND_PORT" == "443" ]]; then
+    die "--port configures the unprivileged HTTP backend; Caddy manages public port 443"
+fi
 
 install_packages() {
     log "Installing required operating-system packages"
@@ -429,6 +499,21 @@ else
         SECURE_COOKIE="${existing_secure_cookie:-$DEFAULT_SECURE_COOKIE}"
     (( trust_proxy_explicit )) || TRUST_PROXY="${existing_trust_proxy:-$DEFAULT_TRUST_PROXY}"
     (( admin_reset_explicit )) || ADMIN_RESET="${existing_admin_reset:-$DEFAULT_ADMIN_RESET}"
+    if [[ -n "$DOMAIN" ]]; then
+        if (( secure_cookie_explicit )) && [[ "$SECURE_COOKIE" != "1" ]]; then
+            die "--domain requires YKT_SECURE_COOKIE=1"
+        fi
+        if (( trust_proxy_explicit )) && [[ "$TRUST_PROXY" != "1" ]]; then
+            die "--domain requires YKT_TRUST_PROXY=1"
+        fi
+        BIND_HOST="127.0.0.1"
+        SECURE_COOKIE="1"
+        TRUST_PROXY="1"
+    elif (( DISABLE_DOMAIN )); then
+        (( host_explicit )) || BIND_HOST="$DEFAULT_BIND_HOST"
+        (( secure_cookie_explicit )) || SECURE_COOKIE="$DEFAULT_SECURE_COOKIE"
+        (( trust_proxy_explicit )) || TRUST_PROXY="$DEFAULT_TRUST_PROXY"
+    fi
     if [[ -z "$ADMIN_PASSWORD" ]]; then
         ADMIN_PASSWORD="$("$PYTHON_BIN" -c 'import secrets; print(secrets.token_urlsafe(24))')"
         PASSWORD_GENERATED=1
@@ -469,7 +554,7 @@ if host != "localhost":
         printf 'YKT_ADMIN_RESET=%s\n' "$ADMIN_RESET"
     } > "$SERVICE_ENV_NEXT"
     chmod 0600 "$SERVICE_ENV_NEXT"
-    trap 'if (( ${SERVICE_ENV_CHANGED:-0} )); then restore_service_env 2>/dev/null || true; fi; if (( ${UNIT_CHANGED:-0} )); then restore_systemd_unit 2>/dev/null || true; fi; rm -f -- "${SERVICE_ENV_NEXT:-}" "${SERVICE_ENV_BACKUP:-}" "${UNIT_TEMP:-}" "${UNIT_BACKUP:-}" 2>/dev/null || true' EXIT
+    trap 'if (( ${CADDY_TRANSACTION_ACTIVE:-0} )); then restore_https_proxy 2>/dev/null || warn "Caddy rollback failed; backup retained at ${CADDY_BACKUP_DIR:-unknown}"; fi; if (( ${SERVICE_ENV_CHANGED:-0} )); then restore_service_env 2>/dev/null || true; fi; if (( ${UNIT_CHANGED:-0} )); then restore_systemd_unit 2>/dev/null || true; fi; rm -f -- "${SERVICE_ENV_NEXT:-}" "${SERVICE_ENV_BACKUP:-}" "${UNIT_TEMP:-}" "${UNIT_BACKUP:-}" 2>/dev/null || true' EXIT
 
     if ! getent group "$SERVICE_USER" >/dev/null 2>&1; then
         groupadd --system "$SERVICE_USER"
@@ -644,6 +729,7 @@ write_deploy_config() {
         printf 'SERVICE_USER=%s\n' "$SERVICE_USER"
         printf 'SERVICE_NAME=%s\n' "$SERVICE_NAME"
         printf 'PYTHON_COMMAND=%s\n' "$PYTHON_BIN"
+        printf 'DOMAIN=%s\n' "$DOMAIN"
     } > "$temp_config" || return 1
     chmod 0600 "$temp_config" || return 1
     mv -f -- "$temp_config" "$DEPLOY_CONFIG" || return 1
@@ -756,6 +842,285 @@ finalize_service_env() {
     return "$result"
 }
 
+set_caddy_paths() {
+    CADDY_MAIN_CONFIG="/etc/caddy/Caddyfile"
+    CADDY_SITE_DIR="/etc/caddy/ykt-web.d"
+    CADDY_SITE_FILE="$CADDY_SITE_DIR/$SERVICE_NAME.caddy"
+    CADDY_IMPORT_LINE="import /etc/caddy/ykt-web.d/*.caddy"
+    CADDY_IMPORT_BEGIN="# BEGIN ykt-web managed import"
+    CADDY_IMPORT_END="# END ykt-web managed import"
+    CADDY_SITE_MARKER="# Managed by ykt-web deploy ($SERVICE_NAME)"
+}
+
+capture_caddy_transaction() {
+    if (( CADDY_TRANSACTION_ACTIVE )); then
+        return 0
+    fi
+    [[ ! -e "$CADDY_BACKUP_DIR" ]] || {
+        warn "Refusing to overwrite an existing Caddy rollback directory: $CADDY_BACKUP_DIR"
+        return 1
+    }
+    CADDY_WAS_ACTIVE=0
+    CADDY_WAS_ENABLED=0
+    systemctl is-active --quiet caddy 2>/dev/null && CADDY_WAS_ACTIVE=1
+    systemctl is-enabled --quiet caddy 2>/dev/null && CADDY_WAS_ENABLED=1
+    install -d -o root -g root -m 0700 -- "$CADDY_BACKUP_DIR" || return 1
+    CADDY_TRANSACTION_ACTIVE=1
+}
+
+install_caddy_package() {
+    command -v caddy >/dev/null 2>&1 && return 0
+    log "Installing Caddy for automatic HTTPS"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update || return 1
+        DEBIAN_FRONTEND=noninteractive apt-get install -y caddy || return 1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y caddy || return 1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y caddy || return 1
+    else
+        warn "No supported package manager was found; install Caddy and retry"
+        return 1
+    fi
+    command -v caddy >/dev/null 2>&1 || {
+        warn "Caddy is unavailable from the configured package repositories"
+        return 1
+    }
+}
+
+check_caddy_file() {
+    local path="$1"
+    local owner mode mode_value
+    [[ ! -e "$path" ]] && return 0
+    [[ -f "$path" && ! -L "$path" ]] || {
+        warn "Refusing unsafe Caddy configuration path: $path"
+        return 1
+    }
+    owner="$(stat -c '%u' -- "$path")" || return 1
+    mode="$(stat -c '%a' -- "$path")" || return 1
+    mode_value=$((8#$mode))
+    [[ "$owner" == "0" && $((mode_value & 8#022)) -eq 0 ]] || {
+        warn "$path must be root-owned and not group/world writable"
+        return 1
+    }
+}
+
+backup_caddy_files() {
+    [[ -f "$CADDY_BACKUP_DIR/.files-captured" ]] && return 0
+    check_caddy_file "$CADDY_MAIN_CONFIG" || return 1
+    check_caddy_file "$CADDY_SITE_FILE" || return 1
+    if [[ -f "$CADDY_SITE_FILE" ]] && \
+       [[ "$(head -n 1 -- "$CADDY_SITE_FILE")" != "$CADDY_SITE_MARKER" ]]; then
+        warn "Refusing to replace unmanaged Caddy site: $CADDY_SITE_FILE"
+        return 1
+    fi
+    if [[ -f "$CADDY_MAIN_CONFIG" ]]; then
+        cp -a -- "$CADDY_MAIN_CONFIG" "$CADDY_BACKUP_DIR/Caddyfile" || return 1
+        : > "$CADDY_BACKUP_DIR/.had-main" || return 1
+    fi
+    if [[ -f "$CADDY_SITE_FILE" ]]; then
+        cp -a -- "$CADDY_SITE_FILE" "$CADDY_BACKUP_DIR/site.caddy" || return 1
+        : > "$CADDY_BACKUP_DIR/.had-site" || return 1
+    fi
+    : > "$CADDY_BACKUP_DIR/.files-captured" || return 1
+}
+
+restore_https_proxy() {
+    local restore_temp result=0
+    (( CADDY_TRANSACTION_ACTIVE )) || return 0
+    set_caddy_paths
+    if [[ -f "$CADDY_BACKUP_DIR/.files-captured" ]]; then
+        if [[ -f "$CADDY_BACKUP_DIR/.had-main" ]]; then
+            restore_temp="$CADDY_MAIN_CONFIG.restore.$$"
+            rm -f -- "$restore_temp" || result=1
+            if ! cp -a -- "$CADDY_BACKUP_DIR/Caddyfile" "$restore_temp" || \
+               ! mv -f -- "$restore_temp" "$CADDY_MAIN_CONFIG"; then
+                result=1
+            fi
+        else
+            rm -f -- "$CADDY_MAIN_CONFIG" || result=1
+        fi
+        if [[ -f "$CADDY_BACKUP_DIR/.had-site" ]]; then
+            install -d -o root -g root -m 0755 -- "$CADDY_SITE_DIR" || result=1
+            restore_temp="$CADDY_SITE_FILE.restore.$$"
+            rm -f -- "$restore_temp" || result=1
+            if ! cp -a -- "$CADDY_BACKUP_DIR/site.caddy" "$restore_temp" || \
+               ! mv -f -- "$restore_temp" "$CADDY_SITE_FILE"; then
+                result=1
+            fi
+        else
+            rm -f -- "$CADDY_SITE_FILE" || result=1
+        fi
+    fi
+    if command -v caddy >/dev/null 2>&1; then
+        if (( CADDY_WAS_ENABLED )); then
+            systemctl enable caddy >/dev/null 2>&1 || result=1
+        else
+            systemctl disable caddy >/dev/null 2>&1 || result=1
+        fi
+        if (( CADDY_WAS_ACTIVE )); then
+            systemctl restart caddy >/dev/null 2>&1 || result=1
+        else
+            systemctl stop caddy >/dev/null 2>&1 || result=1
+        fi
+    elif (( CADDY_WAS_ACTIVE || CADDY_WAS_ENABLED )); then
+        result=1
+    fi
+    if (( result )); then
+        warn "Caddy rollback was incomplete; backup retained at $CADDY_BACKUP_DIR"
+        return 1
+    fi
+    rm -rf -- "$CADDY_BACKUP_DIR" || return 1
+    CADDY_CONFIG_CHANGED=0
+    CADDY_TRANSACTION_ACTIVE=0
+}
+
+finalize_https_proxy() {
+    local result=0
+    (( CADDY_TRANSACTION_ACTIVE )) || return 0
+    rm -rf -- "$CADDY_BACKUP_DIR" || result=1
+    CADDY_CONFIG_CHANGED=0
+    CADDY_TRANSACTION_ACTIVE=0
+    return "$result"
+}
+
+activate_https_proxy() {
+    local unit_definition main_next site_next main_changed=0 site_changed=0
+    local tls_ready=0 attempt
+    if [[ -z "$DOMAIN" && $DISABLE_DOMAIN -eq 0 ]]; then
+        return 0
+    fi
+    set_caddy_paths
+    exec 8>"/run/lock/ykt-web-caddy.lock"
+    flock -n 8 || {
+        warn "Another Caddy configuration change is in progress"
+        return 1
+    }
+    capture_caddy_transaction || return 1
+
+    if [[ -z "$DOMAIN" ]]; then
+        if [[ ! -e "$CADDY_SITE_FILE" ]]; then
+            return 0
+        fi
+        command -v caddy >/dev/null 2>&1 || {
+            warn "The managed Caddy site exists but the caddy command is unavailable"
+            return 1
+        }
+        backup_caddy_files || return 1
+        rm -f -- "$CADDY_SITE_FILE" || return 1
+        CADDY_CONFIG_CHANGED=1
+    else
+        install_caddy_package || {
+            warn "Automatic HTTPS requires the Caddy package"
+            return 1
+        }
+        unit_definition="$(systemctl cat caddy 2>/dev/null)" || {
+            warn "The Caddy systemd service is unavailable"
+            return 1
+        }
+        [[ "$unit_definition" == *"/etc/caddy/Caddyfile"* ]] || {
+            warn "The existing Caddy service uses a non-standard config path; configure it manually"
+            return 1
+        }
+        [[ ! -e "$CADDY_SITE_DIR" || ( -d "$CADDY_SITE_DIR" && ! -L "$CADDY_SITE_DIR" ) ]] || {
+            warn "Refusing unsafe Caddy site directory: $CADDY_SITE_DIR"
+            return 1
+        }
+        install -d -o root -g root -m 0755 -- "$CADDY_SITE_DIR" || return 1
+        backup_caddy_files || return 1
+        main_next="$ADMIN_DIR/.Caddyfile.next.$$"
+        site_next="$ADMIN_DIR/.caddy-site.next.$$"
+        rm -f -- "$main_next" "$site_next" || return 1
+        if [[ -f "$CADDY_MAIN_CONFIG" ]]; then
+            cp -a -- "$CADDY_MAIN_CONFIG" "$main_next" || return 1
+        else
+            : > "$main_next" || return 1
+        fi
+        if ! grep -Fqx -- "$CADDY_IMPORT_LINE" "$main_next"; then
+            if grep -Fq -- "$CADDY_IMPORT_BEGIN" "$main_next" || \
+               grep -Fq -- "$CADDY_IMPORT_END" "$main_next"; then
+                warn "The managed import markers in $CADDY_MAIN_CONFIG are incomplete"
+                return 1
+            fi
+            printf '\n%s\n%s\n%s\n' \
+                "$CADDY_IMPORT_BEGIN" "$CADDY_IMPORT_LINE" "$CADDY_IMPORT_END" \
+                >> "$main_next" || return 1
+        fi
+        cat > "$site_next" <<EOF
+$CADDY_SITE_MARKER
+$DOMAIN {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:$BIND_PORT {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-Host {host}
+    }
+}
+EOF
+        if [[ ! -f "$CADDY_MAIN_CONFIG" ]] || ! cmp -s -- "$main_next" "$CADDY_MAIN_CONFIG"; then
+            main_changed=1
+        fi
+        if [[ ! -f "$CADDY_SITE_FILE" ]] || ! cmp -s -- "$site_next" "$CADDY_SITE_FILE"; then
+            site_changed=1
+        fi
+        if (( site_changed )); then
+            install -o root -g root -m 0644 -- "$site_next" "$CADDY_SITE_FILE.next.$$" || return 1
+            mv -f -- "$CADDY_SITE_FILE.next.$$" "$CADDY_SITE_FILE" || return 1
+            CADDY_CONFIG_CHANGED=1
+        fi
+        if (( main_changed )); then
+            if [[ -f "$CADDY_MAIN_CONFIG" ]]; then
+                cp -a -- "$main_next" "$CADDY_MAIN_CONFIG.next.$$" || return 1
+            else
+                install -o root -g root -m 0644 -- \
+                    "$main_next" "$CADDY_MAIN_CONFIG.next.$$" || return 1
+            fi
+            mv -f -- "$CADDY_MAIN_CONFIG.next.$$" "$CADDY_MAIN_CONFIG" || return 1
+            CADDY_CONFIG_CHANGED=1
+        fi
+        rm -f -- "$main_next" "$site_next"
+    fi
+
+    caddy validate --config "$CADDY_MAIN_CONFIG" --adapter caddyfile || {
+        warn "Caddy rejected the generated HTTPS configuration"
+        return 1
+    }
+    if [[ -z "$DOMAIN" ]]; then
+        if (( CADDY_WAS_ACTIVE && CADDY_CONFIG_CHANGED )); then
+            systemctl reload caddy || return 1
+        fi
+        return 0
+    fi
+    systemctl enable caddy >/dev/null || return 1
+    if systemctl is-active --quiet caddy; then
+        if (( CADDY_CONFIG_CHANGED )); then
+            systemctl reload caddy || return 1
+        fi
+    else
+        systemctl start caddy || return 1
+    fi
+    systemctl is-active --quiet caddy || return 1
+
+    if [[ -n "$DOMAIN" ]]; then
+        if ! getent ahosts "$DOMAIN" >/dev/null 2>&1; then
+            warn "$DOMAIN does not resolve yet; Caddy will obtain a certificate after DNS is ready"
+        fi
+        if command -v curl >/dev/null 2>&1; then
+            for attempt in 1 2 3 4 5; do
+                if curl --fail --silent --show-error --max-time 3 \
+                    --resolve "$DOMAIN:443:127.0.0.1" \
+                    "https://$DOMAIN/api/health" >/dev/null 2>&1; then
+                    tls_ready=1
+                    break
+                fi
+                sleep 2
+            done
+            (( tls_ready )) || warn "HTTPS is not ready yet; verify DNS and inbound TCP ports 80/443"
+        fi
+    fi
+    return 0
+}
+
 if [[ "$BIND_HOST" == "0.0.0.0" || "$BIND_HOST" == "127.0.0.1" || \
       "$BIND_HOST" == "localhost" ]]; then
     HEALTH_HOST="127.0.0.1"
@@ -802,12 +1167,20 @@ print_access_details() {
     if [[ "$access_host" == *:* && "$access_host" != \[*\] ]]; then
         access_host="[$access_host]"
     fi
-    log "Access URL: http://$access_host:$BIND_PORT/"
+    if [[ -n "$DOMAIN" ]]; then
+        log "Access URL: https://$DOMAIN/"
+    else
+        log "Access URL: http://$access_host:$BIND_PORT/"
+    fi
     log "Admin username: $ADMIN_USERNAME"
     if (( PASSWORD_GENERATED )); then
         printf 'Initial admin password (shown once): %s\n' "$ADMIN_PASSWORD"
     fi
-    warn "For Internet access, put the panel behind HTTPS and restrict port $BIND_PORT with the server firewall and cloud security group."
+    if [[ -n "$DOMAIN" ]]; then
+        warn "Allow inbound TCP 80/443 in the cloud security group and firewall; do not expose backend port $BIND_PORT."
+    else
+        warn "For Internet access, rerun this deployer with --domain and restrict port $BIND_PORT."
+    fi
 }
 
 if [[ -n "$CURRENT_COMMIT" && -d "$APP_DIR" ]]; then
@@ -821,7 +1194,8 @@ if [[ -n "$CURRENT_COMMIT" && -d "$APP_DIR" ]]; then
     esac
 fi
 
-if (( UPDATE_MODE && FORCE_DEPLOY == 0 )) && [[ "$CURRENT_COMMIT" == "$TARGET_COMMIT" ]]; then
+if (( UPDATE_MODE && FORCE_DEPLOY == 0 && domain_explicit == 0 )) && \
+   [[ "$CURRENT_COMMIT" == "$TARGET_COMMIT" ]]; then
     log "No update is available; leaving the running service unchanged"
     exit 0
 fi
@@ -865,9 +1239,27 @@ if (( FORCE_DEPLOY == 0 )) && [[ "$CURRENT_COMMIT" == "$TARGET_COMMIT" ]] && \
             fi
         fi
     fi
-    finalize_service_env
-    finalize_systemd_unit
-    write_deploy_config
+    if ! activate_https_proxy; then
+        restore_https_proxy || true
+        restore_service_env || true
+        restore_systemd_unit || true
+        if (( existing_service_active )); then
+            systemctl restart "$SERVICE_NAME" || true
+        else
+            systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        fi
+        die "automatic HTTPS setup failed; previous service settings were restored"
+    fi
+    if ! write_deploy_config; then
+        restore_https_proxy || true
+        restore_service_env || true
+        restore_systemd_unit || true
+        systemctl restart "$SERVICE_NAME" || true
+        die "could not write deployment metadata; previous settings were restored"
+    fi
+    finalize_service_env || warn "could not remove the service-environment rollback copy"
+    finalize_systemd_unit || warn "could not remove the systemd-unit rollback copy"
+    finalize_https_proxy || warn "could not remove the Caddy rollback copy"
     print_access_details
     exit 0
 fi
@@ -893,6 +1285,10 @@ cleanup_staging() {
         elif [[ ! -d "$APP_DIR" && -n "${backup_dir:-}" && -d "$backup_dir" ]]; then
             mv -- "$backup_dir" "$APP_DIR" 2>/dev/null || true
         fi
+    fi
+    if (( ${CADDY_TRANSACTION_ACTIVE:-0} )); then
+        restore_https_proxy || \
+            warn "Caddy rollback failed; backup retained at $CADDY_BACKUP_DIR"
     fi
     if (( ${SERVICE_ENV_CHANGED:-0} )); then
         restore_service_env 2>/dev/null || true
@@ -980,7 +1376,8 @@ if (( RUN_TESTS )); then
     log "Running offline unit tests"
     (
         cd -- "$CANDIDATE_DIR"
-        run_as_builder "$VENV_DIR/bin/python" -m unittest -q test_ykt_web.py test_email_notifier.py
+        run_as_builder "$VENV_DIR/bin/python" -m unittest -q \
+            test_ykt_web.py test_email_notifier.py test_deploy_script.py
     )
 else
     warn "Unit tests were skipped by request"
@@ -1142,6 +1539,9 @@ rollback_release() {
         restore_systemd_unit || warn "could not remove the failed systemd unit"
         restore_admin_metadata || warn "could not restore previous update metadata"
     fi
+    if (( CADDY_TRANSACTION_ACTIVE )); then
+        restore_https_proxy || warn "could not restore the previous Caddy configuration"
+    fi
     prune_release_directories "$FAILED_ROOT" 1 || warn "could not prune old failed releases"
     prune_unused_venvs || warn "could not prune unused environments"
     candidate_activated=0
@@ -1155,6 +1555,7 @@ activate_service_env || rollback_release "could not install the protected servic
 systemctl enable "$SERVICE_NAME" >/dev/null || rollback_release "could not enable the systemd service"
 systemctl restart "$SERVICE_NAME" || rollback_release "systemd could not start the candidate release"
 health_check 30 || rollback_release "candidate release did not pass the HTTP health check"
+activate_https_proxy || rollback_release "automatic HTTPS setup failed"
 
 if [[ "$LOCAL_COMMIT" != "$TARGET_COMMIT" ]]; then
     if ! git -C "$REPOSITORY_DIR" merge --ff-only "$TARGET_COMMIT"; then
@@ -1181,6 +1582,7 @@ candidate_activated=0
 finalize_service_env || warn "could not remove the service-environment rollback copy"
 finalize_systemd_unit || warn "could not remove the systemd rollback copy"
 finalize_admin_metadata || warn "could not remove the update-metadata rollback copy"
+finalize_https_proxy || warn "could not remove the Caddy rollback copy"
 
 prune_release_directories "$BACKUP_ROOT" 1 || warn "could not prune old rollback release"
 prune_release_directories "$FAILED_ROOT" 1 || warn "could not prune old failed release"
