@@ -905,7 +905,7 @@ configure_caddy_apt_repository() (
     public_key_count="$(printf '%s\n' "$key_metadata" | \
         awk -F: '$1 == "pub" { count += 1 } END { print count + 0 }')" || exit 1
     fingerprint="$(printf '%s\n' "$key_metadata" | \
-        awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" { print toupper($10); exit }')" || exit 1
+        awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" && !found { print toupper($10); found = 1 }')" || exit 1
     if [[ "$public_key_count" != "1" || "$fingerprint" != "$expected_fingerprint" ]]; then
         warn "Caddy repository signing key fingerprint mismatch"
         exit 1
@@ -926,7 +926,7 @@ configure_caddy_apt_repository() (
         public_key_count="$(printf '%s\n' "$key_metadata" | \
             awk -F: '$1 == "pub" { count += 1 } END { print count + 0 }')" || exit 1
         fingerprint="$(printf '%s\n' "$key_metadata" | \
-            awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" { print toupper($10); exit }')" || exit 1
+            awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" && !found { print toupper($10); found = 1 }')" || exit 1
         [[ "$public_key_count" == "1" && "$fingerprint" == "$expected_fingerprint" ]] || {
             warn "Existing Caddy keyring has an unexpected fingerprint"
             exit 1
@@ -974,13 +974,13 @@ install_caddy_package() {
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update || return 1
         candidate="$(LC_ALL=C apt-cache policy caddy 2>/dev/null | \
-            awk '/Candidate:/ { print $2; exit }')" || return 1
+            awk '/Candidate:/ && !found { print $2; found = 1 }')" || return 1
         if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
             warn "Caddy is unavailable from the current APT sources; adding the official signed repository"
             configure_caddy_apt_repository || return 1
             apt-get update || return 1
             candidate="$(LC_ALL=C apt-cache policy caddy 2>/dev/null | \
-                awk '/Candidate:/ { print $2; exit }')" || return 1
+                awk '/Candidate:/ && !found { print $2; found = 1 }')" || return 1
             [[ -n "$candidate" && "$candidate" != "(none)" ]] || {
                 warn "The official Caddy repository has no installable package candidate"
                 return 1

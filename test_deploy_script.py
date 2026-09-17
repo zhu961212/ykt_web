@@ -66,6 +66,7 @@ class DeployScriptHttpsTests(unittest.TestCase):
             self.skipTest("bash is unavailable")
         functions = self.section("caddy_package_installed() {", "check_caddy_file() {")
         shell = (
+            "set -o pipefail\n"
             "TRACE=''\n"
             f"FAKE_CANDIDATE={int(candidate)}\n"
             f"FAKE_INSTALL_FAILS={int(install_fails)}\n"
@@ -75,7 +76,11 @@ class DeployScriptHttpsTests(unittest.TestCase):
             "warn() { :; }\n"
             "caddy() { :; }\n"
             "dpkg-query() { (( FAKE_INSTALLED )) && printf 'install ok installed'; }\n"
-            "apt-cache() { (( FAKE_CANDIDATE )) && printf '  Candidate: 2.10.2\\n' || printf '  Candidate: (none)\\n'; }\n"
+            "apt-cache() {\n"
+            "  local line\n"
+            "  (( FAKE_CANDIDATE )) && printf '  Candidate: 2.10.2\\n' || printf '  Candidate: (none)\\n'\n"
+            "  for ((line = 0; line < 20000; line += 1)); do printf '  package metadata line %s\\n' \"$line\"; done\n"
+            "}\n"
             "configure_caddy_apt_repository() { trace repo; FAKE_CANDIDATE=1; }\n"
             "apt-get() {\n"
             "  trace \"apt-get:$*\"\n"
