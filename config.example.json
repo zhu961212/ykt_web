@@ -9,6 +9,17 @@
   "lesson": {
     "poll_interval": 3
   },
+  "email": {
+    "enabled": false,
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 465,
+    "security": "ssl",
+    "username": "notify@example.com",
+    "password": "",
+    "from_address": "notify@example.com",
+    "to_address": "you@example.com",
+    "cooldown_seconds": 900
+  },
   "bot": {
     "dry_run": true,
     "wait_manual_checkin": true,

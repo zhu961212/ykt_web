@@ -7,16 +7,22 @@
 运行:  python server.py   ->  http://127.0.0.1:8765
 """
 import asyncio
+import copy
 import hashlib
+import hmac
+import ipaddress
 import json
 import os
+import secrets
+import string
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from pathlib import Path
 
 import aiohttp
 from aiohttp import web
 
+import email_notifier as emailer
 import ykt_core as core
 
 ROOT = Path(__file__).resolve().parent
@@ -35,6 +41,7 @@ DEFAULTS = {
         "vision_enabled": False,
     },
     "lesson": {"poll_interval": 3},
+    "email": dict(emailer.DEFAULT_EMAIL_SETTINGS),
     "bot": {
         "dry_run": True,
         "wait_manual_checkin": True,
@@ -55,8 +62,11 @@ def load_config() -> dict:
     merged = {**DEFAULTS, **loaded}
     merged["llm"] = {**DEFAULTS["llm"], **loaded.get("llm", {})}
     merged["lesson"] = {**DEFAULTS["lesson"], **loaded.get("lesson", {})}
+    merged["email"] = emailer.merge_email_settings(
+        DEFAULTS["email"], loaded.get("email", {}),
+    )
     merged["bot"] = {**DEFAULTS["bot"], **loaded.get("bot", {})}
-    # This project intentionally never performs attendance on the user's behalf.
+    # Background watching never joins a class; scan check-in requires an explicit user action.
     merged["bot"]["wait_manual_checkin"] = True
     return merged
 
@@ -75,14 +85,188 @@ def public_llm_config(config=None) -> dict:
     }
 
 
+def public_email_config(config=None) -> dict:
+    return emailer.public_email_settings((config or cfg).get("email", {}))
+
+
+def public_admin_config(request=None, config=None) -> dict:
+    runtime = getattr(request, "app", {}).get("runtime_config", {}) if request else {}
+    username = runtime.get("username")
+    if not username:
+        persisted = (config or cfg).get("admin")
+        username = persisted.get("username") if isinstance(persisted, dict) else None
+    persisted = (config or cfg).get("admin")
+    password_required = (bool(runtime.get("auth_enabled")) if runtime
+                         else bool(isinstance(persisted, dict)
+                                   or os.environ.get("YKT_ADMIN_PASSWORD")))
+    return {
+        "username": str(username or os.environ.get("YKT_ADMIN_USERNAME") or "admin"),
+        "password_required": password_required,
+        "reset_mode": bool(runtime.get("admin_reset", False)),
+    }
+
+
+def public_scanner_config(request=None, config=None) -> dict:
+    runtime = getattr(request, "app", {}).get("runtime_config", {}) if request else {}
+    configured = (bool(runtime.get("scanner_enabled")) if runtime
+                  else isinstance((config or cfg).get("scanner"), dict))
+    return {"configured": configured, "path": "/scan"}
+
+
+ADMIN_USERNAME_CHARS = frozenset(string.ascii_letters + string.digits + "-._@")
+ADMIN_PASSWORD_CHARS = frozenset(string.ascii_letters + string.digits + "-._~")
+ADMIN_PASSWORD_ITERATIONS = 310_000
+SCANNER_PASSWORD_ITERATIONS = 210_000
+
+
+def _validate_admin_username(value):
+    value = str(value or "").strip()
+    if not value or len(value) > 128 or any(char not in ADMIN_USERNAME_CHARS for char in value):
+        raise ValueError("管理员账号只能使用字母、数字及 - . _ @")
+    return value
+
+
+def _validate_admin_password(value, *, allow_empty=False):
+    if not isinstance(value, str):
+        raise ValueError("管理员密码必须是字符串")
+    if allow_empty and not value:
+        return value
+    if not 12 <= len(value) <= 256 or any(char not in ADMIN_PASSWORD_CHARS for char in value):
+        raise ValueError("管理员密码必须为 12-256 位，只能使用字母、数字及 - . _ ~")
+    return value
+
+
+def _validate_scanner_password(value):
+    if (not isinstance(value, str) or not 8 <= len(value) <= 128
+            or any(char not in ADMIN_PASSWORD_CHARS for char in value)):
+        raise ValueError("扫码页密码必须为 8-128 位，只能使用字母、数字及 - . _ ~")
+    return value
+
+
+def _password_digest(password, salt, iterations):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+
+
+def _persisted_admin_credentials(config):
+    value = (config or {}).get("admin")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise RuntimeError("config.json 的 admin 配置无效")
+    try:
+        username = _validate_admin_username(value.get("username"))
+        salt = bytes.fromhex(str(value.get("password_salt") or ""))
+        password_hash = bytes.fromhex(str(value.get("password_hash") or ""))
+        iterations = int(value.get("password_iterations") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("config.json 的管理员凭据无效") from exc
+    if len(salt) != 16 or len(password_hash) != 32 or not 100_000 <= iterations <= 2_000_000:
+        raise RuntimeError("config.json 的管理员凭据无效")
+    return {
+        "username": username,
+        "password": "",
+        "password_salt": salt,
+        "password_hash": password_hash,
+        "password_iterations": iterations,
+    }
+
+
+def _persisted_scanner_credentials(config):
+    value = (config or {}).get("scanner")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise RuntimeError("config.json 的 scanner 配置无效")
+    try:
+        salt = bytes.fromhex(str(value.get("password_salt") or ""))
+        password_hash = bytes.fromhex(str(value.get("password_hash") or ""))
+        iterations = int(value.get("password_iterations") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("config.json 的扫码页凭据无效") from exc
+    if len(salt) != 16 or len(password_hash) != 32 or not 100_000 <= iterations <= 2_000_000:
+        raise RuntimeError("config.json 的扫码页凭据无效")
+    return {
+        "scanner_password_salt": salt,
+        "scanner_password_hash": password_hash,
+        "scanner_password_iterations": iterations,
+    }
+
+
+def server_runtime_config(environ=None, config=None) -> dict:
+    environ = os.environ if environ is None else environ
+    host = str(environ.get("YKT_HOST") or "127.0.0.1").strip()
+    username = str(environ.get("YKT_ADMIN_USERNAME") or "admin")
+    password = str(environ.get("YKT_ADMIN_PASSWORD") or "")
+    try:
+        port = int(environ.get("YKT_PORT") or 8765)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("YKT_PORT 必须是 1-65535 的整数") from exc
+    if not 1 <= port <= 65535:
+        raise RuntimeError("YKT_PORT 必须是 1-65535 的整数")
+    if not host or len(host) > 253 or any(char.isspace() for char in host):
+        raise RuntimeError("YKT_HOST 无效")
+    try:
+        address = ipaddress.ip_address(host)
+        loopback = address.is_loopback
+    except ValueError:
+        if host != "localhost":
+            raise RuntimeError("YKT_HOST 必须是 IP 地址或 localhost")
+        loopback = True
+    try:
+        username = _validate_admin_username(username)
+        password = _validate_admin_password(password, allow_empty=True)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    secure_cookie = str(environ.get("YKT_SECURE_COOKIE") or "").lower()
+    if secure_cookie not in ("", "0", "1", "false", "true"):
+        raise RuntimeError("YKT_SECURE_COOKIE 必须是 0 或 1")
+    trust_proxy = str(environ.get("YKT_TRUST_PROXY") or "").lower()
+    if trust_proxy not in ("", "0", "1", "false", "true"):
+        raise RuntimeError("YKT_TRUST_PROXY 必须是 0 或 1")
+    trust_proxy_enabled = trust_proxy in ("1", "true")
+    admin_reset = str(environ.get("YKT_ADMIN_RESET") or "").lower()
+    if admin_reset not in ("", "0", "1", "false", "true"):
+        raise RuntimeError("YKT_ADMIN_RESET 必须是 0 或 1")
+    admin_reset_enabled = admin_reset in ("1", "true")
+    persisted = None if admin_reset_enabled else _persisted_admin_credentials(config)
+    scanner = _persisted_scanner_credentials(config)
+    auth_enabled = bool(password)
+    if persisted is not None:
+        username = persisted["username"]
+        password = ""
+        auth_enabled = True
+    if (not loopback or trust_proxy_enabled) and not auth_enabled:
+        raise RuntimeError("远程访问或反向代理模式必须设置至少 12 位的 YKT_ADMIN_PASSWORD")
+    settings = {
+        "host": host,
+        "port": port,
+        "auth_enabled": auth_enabled,
+        "username": username,
+        "password": password,
+        "secure_cookie": secure_cookie in ("1", "true"),
+        "trust_proxy": trust_proxy_enabled,
+        "admin_reset": admin_reset_enabled,
+        "session_secret": secrets.token_bytes(32),
+        "scanner_enabled": scanner is not None,
+        "scanner_session_secret": secrets.token_bytes(32),
+    }
+    if persisted is not None:
+        settings.update(persisted)
+    if scanner is not None:
+        settings.update(scanner)
+    return settings
+
+
 def _atomic_json_write(path: Path, value: dict):
     temp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
         with temp.open("w", encoding="utf-8") as handle:
+            os.chmod(temp, 0o600)
             json.dump(value, handle, ensure_ascii=False, indent=2)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
+        os.chmod(path, 0o600)
     finally:
         temp.unlink(missing_ok=True)
 
@@ -267,14 +451,90 @@ class AccountHub:
         self.current_problem = None
 
 
+class SharedAnswerPool:
+    """Deduplicate LLM work for the same problem across account watchers."""
+
+    def __init__(self, max_completed: int = 512):
+        self.max_completed = max(1, int(max_completed))
+        self._completed = OrderedDict()
+        self._inflight = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _key(server_key, lesson_id, problem_id):
+        return str(server_key), str(lesson_id), str(problem_id)
+
+    @staticmethod
+    def _observe_task(task: asyncio.Task):
+        if not task.cancelled():
+            task.exception()
+
+    async def _remove_inflight(self, key, task):
+        async with self._lock:
+            if self._inflight.get(key) is task:
+                self._inflight.pop(key, None)
+
+    async def _run(self, key, problem: dict, solver):
+        try:
+            result = await solver.solve(problem)
+        except asyncio.CancelledError:
+            await self._remove_inflight(key, asyncio.current_task())
+            raise
+        except Exception:
+            await self._remove_inflight(key, asyncio.current_task())
+            raise
+
+        async with self._lock:
+            if self._inflight.get(key) is asyncio.current_task():
+                self._inflight.pop(key, None)
+                if result is not None:
+                    self._completed[key] = copy.deepcopy(result)
+                    self._completed.move_to_end(key)
+                    while len(self._completed) > self.max_completed:
+                        self._completed.popitem(last=False)
+        return result
+
+    async def solve(self, server_key, lesson_id, problem_id, problem: dict, solver):
+        key = self._key(server_key, lesson_id, problem_id)
+        async with self._lock:
+            cached = self._completed.get(key)
+            if cached is not None:
+                self._completed.move_to_end(key)
+                return copy.deepcopy(cached)
+            task = self._inflight.get(key)
+            if task is None:
+                task = asyncio.create_task(
+                    self._run(key, copy.deepcopy(problem), solver),
+                    name=f"shared-answer-{key[1]}-{key[2]}",
+                )
+                task.add_done_callback(self._observe_task)
+                self._inflight[key] = task
+        return copy.deepcopy(await asyncio.shield(task))
+
+    async def clear(self):
+        async with self._lock:
+            tasks = list(self._inflight.values())
+            self._inflight.clear()
+            self._completed.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
 class Watcher:
     """waiting -> manual check-in detection -> WebSocket classroom -> waiting."""
 
-    def __init__(self, cfg: dict, client: core.YuketangClient, solver: core.LLMSolver, hub: Hub):
+    def __init__(self, cfg: dict, client: core.YuketangClient, solver: core.LLMSolver,
+                 hub: Hub, answer_pool: SharedAnswerPool = None,
+                 notifier: emailer.EmailNotifier = None):
         self.cfg = cfg
         self.client = client
         self.solver = solver
         self.hub = hub
+        self.answer_pool = answer_pool or SharedAnswerPool()
+        self._owns_answer_pool = answer_pool is None
+        self.notifier = notifier
         self.account_id = getattr(hub, "account_id", "single")
         self.running = False
         self.task = None
@@ -293,6 +553,7 @@ class Watcher:
         self._manual_join_event = asyncio.Event()
         self._manual_join_ready_for = ""
         self._lesson_generation = 0
+        self._monitor_failures = 0
         self._ws = None
 
     def set_state(self, phase: str, detail=None, **values):
@@ -312,7 +573,7 @@ class Watcher:
         self.running = True
         self.task = asyncio.create_task(self._run(), name=f"watcher-{self.account_id}")
         self.set_state("waiting", "正在查询上课课程")
-        self.hub.log("监课已启动（只检测手动签到，不会代签）")
+        self.hub.log("监课已启动（等待 App 手动签到或面板扫码签到）")
         return True
 
     async def stop(self):
@@ -324,6 +585,11 @@ class Watcher:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await self._cancel_class_tasks()
+        if self.notifier is not None:
+            self.notifier.clear(f"{self.account_id}:monitor")
+            self.notifier.clear(f"{self.account_id}:classroom_connection")
+        if self._owns_answer_pool:
+            await self.answer_pool.clear()
         self._clear_class()
         self.set_state("idle", "已停止", lesson_id="", course_name="")
         if was_running:
@@ -365,6 +631,9 @@ class Watcher:
                 rooms = await self.client.get_on_lesson()
                 lesson = self._pick_lesson(rooms)
                 if not lesson:
+                    self._monitor_failures = 0
+                    if self.notifier is not None:
+                        self.notifier.clear(f"{self.account_id}:monitor")
                     self.set_state("waiting", f"暂无在上课课程，{poll:g}s 后重试",
                                    lesson_id="", course_name="")
                     await asyncio.sleep(poll)
@@ -383,6 +652,9 @@ class Watcher:
                     continue
                 if not self.running:
                     break
+                self._monitor_failures = 0
+                if self.notifier is not None:
+                    self.notifier.clear(f"{self.account_id}:monitor")
                 self.hub.log("检测到手动签到完成，开始监听课堂实时事件")
                 reason = await self._in_class(lid, cname)
                 await self._cancel_class_tasks()
@@ -396,6 +668,15 @@ class Watcher:
             raise
         except Exception as exc:
             if self.running:
+                if isinstance(exc, core.AuthenticationExpired):
+                    self._notify_issue("authorization", "雨课堂账号授权已失效", str(exc))
+                else:
+                    self._monitor_failures += 1
+                    if self._monitor_failures >= 3:
+                        self._notify_issue(
+                            "monitor", "雨课堂监课连续异常",
+                            f"监课已连续失败 {self._monitor_failures} 次: {exc}",
+                        )
                 self.hub.log(f"监课循环异常: {exc}", "error")
                 self.set_state("error", f"监课异常，5s 后重试: {exc}")
                 await asyncio.sleep(5)
@@ -423,6 +704,9 @@ class Watcher:
             if self._manual_join_ready_for == lesson_id:
                 return True
             result = await self.client.checkin(lesson_id, join_if_not_in=False)
+            self._monitor_failures = 0
+            if self.notifier is not None:
+                self.notifier.clear(f"{self.account_id}:monitor")
             if not self.running or self.lesson_id != lesson_id:
                 return False
             if result.get("ok"):
@@ -438,6 +722,8 @@ class Watcher:
                 missing_polls = 0 if still_active else missing_polls + 1
                 if missing_polls >= 2:
                     return False
+            except core.AuthenticationExpired:
+                raise
             except Exception as exc:
                 self.hub.log(f"确认课程状态失败，将继续等待: {exc}", "warn")
             waited += poll
@@ -455,7 +741,11 @@ class Watcher:
             return {"ok": False, "message": "尚未发现上课课程或监课未启动"}
         lesson_id = self.lesson_id
         generation = self._lesson_generation
-        result = await self.client.checkin(lesson_id, join_if_not_in=False)
+        try:
+            result = await self.client.checkin(lesson_id, join_if_not_in=False)
+        except core.AuthenticationExpired as exc:
+            self._notify_issue("authorization", "雨课堂账号授权已失效", str(exc))
+            return {"ok": False, "message": "账号授权已失效，请重新登录"}
         if not self.running or self.lesson_id != lesson_id or self._lesson_generation != generation:
             return {"ok": False, "message": "课程状态已变化，请重新检测"}
         if not result.get("ok"):
@@ -507,6 +797,11 @@ class Watcher:
             except Exception as exc:
                 failures += 1
                 self.hub.log(f"课堂通道异常: {exc}", "warn")
+                if failures >= 3:
+                    self._notify_issue(
+                        "classroom_connection", "雨课堂课堂连接连续异常",
+                        f"课堂 {lesson_id} 已连续连接失败 {failures} 次: {exc}",
+                    )
             finally:
                 self._ws = None
 
@@ -520,6 +815,9 @@ class Watcher:
                     self.client.bearer = refreshed["bearer"]
                     self.client.lesson_token = refreshed["lesson_token"]
                     self.hub.log("课堂凭证已刷新，准备重连", "debug")
+            except core.AuthenticationExpired as exc:
+                self._notify_issue("authorization", "雨课堂账号授权已失效", str(exc))
+                raise
             except Exception as exc:
                 self.hub.log(f"重连前状态确认失败: {exc}", "warn")
             delay = min(2 ** min(failures, 4), 15)
@@ -559,9 +857,28 @@ class Watcher:
         if error:
             self.hub.log(f"后台任务 {task.get_name()} 失败: {error}", "warn")
 
+    def _notify_issue(self, category: str, subject: str, detail: str):
+        if self.notifier is None:
+            return
+        account_name = getattr(self.hub, "account_name", "") or self.client.user_name
+        body = (
+            "雨课堂答题面板检测到需要处理的问题。\n\n"
+            f"账号: {account_name or self.client.user_id or self.account_id}\n"
+            f"服务: {self.client.server_key}\n"
+            f"课堂: {self.course_name or '-'} ({self.lesson_id or '-'})\n"
+            f"详情: {str(detail)[:1000]}\n"
+            f"时间: {time.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
+        )
+        self._spawn_background(
+            self.notifier.notify(f"{self.account_id}:{category}", subject, body),
+            f"email-{category}",
+        )
+
     async def _on_event(self, event: dict):
         op = event.get("op") or event.get("type") or ""
         if op in ("hello", "showpresentation", "presentationupdated"):
+            if op == "hello" and self.notifier is not None:
+                self.notifier.clear(f"{self.account_id}:classroom_connection")
             if op != "presentationupdated" and event.get("message") == "lesson finished":
                 self.hub.log("服务端通知课堂已结束")
                 raise _LessonFinished()
@@ -628,6 +945,10 @@ class Watcher:
             data = await self.client.fetch_presentation(presentation_id)
         except asyncio.CancelledError:
             raise
+        except core.AuthenticationExpired as exc:
+            self._notify_issue("authorization", "雨课堂课堂授权已失效", str(exc))
+            self.hub.log(f"课件 {presentation_id} 获取失败: {exc}", "warn")
+            return False
         except Exception as exc:
             self.hub.log(f"课件 {presentation_id} 获取失败: {exc}", "warn")
             return False
@@ -661,11 +982,15 @@ class Watcher:
             self._presentation_inflight.pop(presentation_id, None)
         self._background_done(task)
 
-    async def _load_presentation(self, presentation_id, force=False):
+    async def _load_presentation(self, presentation_id, force=False, required_problem_id=None):
         presentation_id = self._presentation_id(presentation_id)
         if presentation_id is None:
             return False
         presentation_id = str(presentation_id)
+        if required_problem_id is not None and str(required_problem_id) in self.problems:
+            if self.active_pres_id is None or presentation_id == self.active_pres_id:
+                self.current_pres = presentation_id
+            return True
         if not force and presentation_id in self._presentation_cache:
             if self.active_pres_id is None or presentation_id == self.active_pres_id:
                 self.current_pres = presentation_id
@@ -755,7 +1080,9 @@ class Watcher:
                 if remaining > 0.25:
                     try:
                         await asyncio.wait_for(
-                            self._load_presentation(presentation_id, force=True),
+                            self._load_presentation(
+                                presentation_id, force=True, required_problem_id=problem_id,
+                            ),
                             timeout=max(0.1, remaining - 0.1),
                         )
                     except asyncio.TimeoutError:
@@ -788,7 +1115,13 @@ class Watcher:
                 error = "模型尚未确认支持图片输入"
             elif solve_budget > 0.1:
                 try:
-                    solved = await asyncio.wait_for(self.solver.solve(problem), timeout=solve_budget)
+                    solved = await asyncio.wait_for(
+                        self.answer_pool.solve(
+                            self.client.server_key, window["lesson_id"], problem_id,
+                            problem, self.solver,
+                        ),
+                        timeout=solve_budget,
+                    )
                 except asyncio.TimeoutError:
                     error = "LLM 超时"
                 except Exception as exc:
@@ -831,6 +1164,10 @@ class Watcher:
                     status = "submitted" if code == 0 else f"failed({code})"
                     self.hub.log(f"[提交] {problem_id} {type_name} => {solved['display']} code={code}",
                                  "info" if code == 0 else "error")
+                except core.AuthenticationExpired as exc:
+                    status = "failed(auth)"
+                    self._notify_issue("authorization", "雨课堂课堂授权已失效", str(exc))
+                    self.hub.log(f"题目 {problem_id} 提交失败: {exc}", "error")
                 except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
                     status = "failed(timeout)"
                     self.hub.log(f"题目 {problem_id} 提交未在安全窗口内完成: {exc}", "error")
@@ -893,6 +1230,10 @@ class AccountManager:
         self.cfg = config
         self.solver = shared_solver
         self.panel = panel
+        self.notifier = emailer.EmailNotifier(
+            config.get("email", {}), getattr(panel, "log", None),
+        )
+        self.answer_pool = SharedAnswerPool()
         self.accounts = {}
         self.records = load_account_records()
         self.lock = asyncio.Lock()
@@ -904,7 +1245,10 @@ class AccountManager:
             self.panel, account_id, account_client.user_name or account_client.user_id,
         )
         account_hub.state["dry_run"] = self.cfg["bot"].get("dry_run", True)
-        account_watcher = Watcher(self.cfg, account_client, self.solver, account_hub)
+        account_watcher = Watcher(
+            self.cfg, account_client, self.solver, account_hub,
+            self.answer_pool, self.notifier,
+        )
         return AccountRuntime(account_id, session, account_client, account_watcher, account_hub)
 
     async def restore_all(self):
@@ -925,6 +1269,10 @@ class AccountManager:
         account_client = core.YuketangClient(account_cfg, session)
         try:
             if not await account_client.restore_session(record):
+                await self._notify_saved_session_issue(
+                    account_id, record, "雨课堂账号授权已失效",
+                    "保存的登录态已失效，请重新扫码登录。",
+                )
                 self.panel.log_account(
                     account_id, record.get("user_name") or record.get("user_id"),
                     "保存的登录态已失效，请重新扫码", "warn",
@@ -951,6 +1299,10 @@ class AccountManager:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            await self._notify_saved_session_issue(
+                account_id, record, "雨课堂账号会话恢复失败",
+                f"服务启动时无法恢复账号会话: {str(exc)[:1000]}",
+            )
             self.panel.log_account(
                 account_id, record.get("user_name") or record.get("user_id"),
                 f"账号会话恢复失败: {exc}", "warn",
@@ -959,14 +1311,26 @@ class AccountManager:
             if session is not None and not session.closed:
                 await session.close()
 
+    async def _notify_saved_session_issue(self, account_id, record, subject, detail):
+        account_name = record.get("user_name") or record.get("user_id") or account_id
+        body = (
+            "雨课堂答题面板检测到账号会话问题。\n\n"
+            f"账号: {account_name}\n"
+            f"服务: {record.get('server') or '-'}\n"
+            f"详情: {str(detail)[:1000]}\n"
+            f"时间: {time.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
+        )
+        await self.notifier.notify(f"{account_id}:authorization", subject, body)
+
     async def add_verified(self, source: core.YuketangClient):
         if self.closing:
             raise RuntimeError("服务正在关闭")
         account_id = account_id_for(source.server_key, source.user_id)
         async with self.lock:
             existing = self.accounts.get(account_id)
-            if existing is not None:
-                return existing, False
+        if existing is not None:
+            self.notifier.clear_prefix(f"{account_id}:")
+            return existing, False
 
         session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
         account_cfg = {**self.cfg, "server": source.server_key}
@@ -977,15 +1341,18 @@ class AccountManager:
             record = client_session_record(account_client, account_id)
             async with self.lock:
                 existing = self.accounts.get(account_id)
-                if existing is not None:
-                    return existing, False
-                candidate = dict(self.records)
-                candidate[account_id] = record
-                save_account_records(candidate)
-                self.records = candidate
-                self.accounts[account_id] = runtime
+                if existing is None:
+                    candidate = dict(self.records)
+                    candidate[account_id] = record
+                    save_account_records(candidate)
+                    self.records = candidate
+                    self.accounts[account_id] = runtime
+            if existing is not None:
+                self.notifier.clear_prefix(f"{account_id}:")
+                return existing, False
             session = None
             _refresh_legacy_aliases()
+            self.notifier.clear_prefix(f"{account_id}:")
             if self.cfg["bot"].get("auto_start_watching", True):
                 runtime.watcher.start()
             else:
@@ -1012,7 +1379,10 @@ class AccountManager:
             save_account_records(candidate)
             self.records = candidate
             runtime = self.accounts.pop(account_id, None)
+            if not self.accounts:
+                await self.answer_pool.clear()
         _refresh_legacy_aliases()
+        self.notifier.clear_prefix(f"{account_id}:")
         if runtime is not None:
             await runtime.close()
         await self.panel.sync_state()
@@ -1020,15 +1390,97 @@ class AccountManager:
 
     async def clear(self):
         async with self.lock:
+            account_ids = set(self.records) | set(self.accounts)
             save_account_records({})
             self.records = {}
             runtimes = list(self.accounts.values())
             self.accounts = {}
+            await self.answer_pool.clear()
         _refresh_legacy_aliases()
+        for account_id in account_ids:
+            self.notifier.clear_prefix(f"{account_id}:")
         if runtimes:
             await asyncio.gather(*(runtime.close() for runtime in runtimes),
                                  return_exceptions=True)
         await self.panel.sync_state()
+
+    async def scan_all(self, qr_content: str):
+        async with self.lock:
+            runtimes = list(self.accounts.values())
+        semaphore = asyncio.Semaphore(8)
+
+        async def scan_one(runtime):
+            async with semaphore, runtime.op_lock:
+                if runtime.closing:
+                    return {"ok": False, "message": "账号正在关闭"}
+                try:
+                    rooms = await runtime.client.get_on_lesson()
+                    enrolled_lessons = {
+                        str(room.get("lessonId") or room.get("lesson_id"))
+                        for room in rooms if isinstance(room, dict)
+                    }
+                    lesson_id = await runtime.client.scan_qr(qr_content)
+                    if lesson_id is None or not str(lesson_id).strip():
+                        raise RuntimeError("二维码未返回课堂标识")
+                    lesson_id = str(lesson_id)
+                    if lesson_id not in enrolled_lessons:
+                        runtime.hub.log(
+                            f"跳过扫码签到: 账号未加入 lessonId={lesson_id}", "warn",
+                        )
+                        return {
+                            "ok": False, "status": "not_enrolled",
+                            "lesson_id": lesson_id, "message": "账号未加入该课程",
+                        }
+                    result = await runtime.client.checkin(lesson_id, join_if_not_in=False)
+                except core.QRCodeScanError as exc:
+                    runtime.hub.log(f"扫码签到失败: {exc}", "error")
+                    return {"ok": False, "code": exc.code, "message": str(exc)}
+                except core.AuthenticationExpired as exc:
+                    runtime.watcher._notify_issue(
+                        "authorization", "雨课堂账号授权已失效", str(exc),
+                    )
+                    runtime.hub.log(f"扫码签到失败: {exc}", "error")
+                    return {"ok": False, "message": "账号授权已失效"}
+                except Exception as exc:
+                    runtime.hub.log(f"扫码签到失败: {exc}", "error")
+                    return {"ok": False, "message": str(exc)[:300]}
+
+                if not result.get("ok"):
+                    message = str(result.get("message") or "签到失败")[:300]
+                    runtime.hub.log(f"扫码签到失败: {message}", "error")
+                    return {
+                        "ok": False, "lesson_id": lesson_id,
+                        "code": result.get("code"), "message": message,
+                    }
+                watcher = runtime.watcher
+                credentials_applied = (
+                    not watcher.running or not watcher.lesson_id or watcher.lesson_id == lesson_id
+                )
+                if credentials_applied:
+                    runtime.client.bearer = result["bearer"]
+                    runtime.client.lesson_token = result["lesson_token"]
+                if watcher.running and watcher.lesson_id == lesson_id:
+                    watcher._manual_join_ready_for = lesson_id
+                    watcher._manual_join_event.set()
+                runtime.hub.log(f"扫码签到成功: lessonId={lesson_id}")
+                return {
+                    "ok": True, "lesson_id": lesson_id,
+                    "credentials_applied": credentials_applied,
+                }
+
+        values = await asyncio.gather(*(scan_one(runtime) for runtime in runtimes))
+        results = []
+        for runtime, result in zip(runtimes, values):
+            results.append({
+                "account_id": runtime.account_id,
+                "account_name": runtime.client.user_name or runtime.client.user_id,
+                **result,
+            })
+        return {
+            "total": len(results),
+            "success": sum(bool(item.get("ok")) for item in results),
+            "results": results,
+        }
 
     async def start_all(self):
         results = {}
@@ -1042,12 +1494,17 @@ class AccountManager:
         if runtimes:
             await asyncio.gather(*(runtime.watcher.stop() for runtime in runtimes),
                                  return_exceptions=True)
+        await self.answer_pool.clear()
         await self.panel.sync_state()
 
     def set_solver(self, value: core.LLMSolver):
         self.solver = value
+        # Existing entries stay pinned so late accounts submit the same answer.
         for runtime in self.accounts.values():
             runtime.watcher.solver = value
+
+    def set_email_config(self, settings):
+        self.notifier.configure(settings)
 
     def public_accounts(self) -> list[dict]:
         values = [runtime.public_state(account_id in self.records)
@@ -1080,6 +1537,8 @@ class AccountManager:
             await asyncio.gather(*(runtime.close() for runtime in runtimes),
                                  return_exceptions=True)
         self.accounts.clear()
+        await self.notifier.close()
+        await self.answer_pool.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1109,6 +1568,184 @@ class QRAttempt:
 
 qr_attempt = None
 config_revision = 0
+AUTH_COOKIE_NAME = "ykt_admin_session"
+SCANNER_COOKIE_NAME = "ykt_scanner_session"
+
+
+def _admin_password_matches(settings, password):
+    if settings.get("password_hash"):
+        candidate = _password_digest(
+            password, settings["password_salt"], settings["password_iterations"],
+        )
+        return hmac.compare_digest(candidate, settings["password_hash"])
+    return hmac.compare_digest(
+        password.encode("utf-8"), settings["password"].encode("utf-8")
+    )
+
+
+def _scanner_password_matches(settings, password):
+    if not settings.get("scanner_enabled"):
+        return False
+    candidate = _password_digest(
+        password,
+        settings["scanner_password_salt"],
+        settings["scanner_password_iterations"],
+    )
+    return hmac.compare_digest(candidate, settings["scanner_password_hash"])
+
+
+def _admin_session_token(settings, issued_at=None):
+    issued_at = int(time.time()) if issued_at is None else int(issued_at)
+    message = f"ykt-web-admin-session-v1\0{settings['username']}\0{issued_at}".encode("utf-8")
+    credential_secret = settings.get("password_hash") or settings["password"].encode("utf-8")
+    key = hmac.new(credential_secret, settings["session_secret"], hashlib.sha256).digest()
+    signature = hmac.new(
+        key, message, hashlib.sha256,
+    ).hexdigest()
+    return f"{issued_at}.{signature}"
+
+
+def _scanner_session_token(settings, issued_at=None):
+    issued_at = int(time.time()) if issued_at is None else int(issued_at)
+    message = f"ykt-web-scanner-session-v1\0{issued_at}".encode("utf-8")
+    key = hmac.new(
+        settings["scanner_password_hash"],
+        settings["scanner_session_secret"],
+        hashlib.sha256,
+    ).digest()
+    signature = hmac.new(key, message, hashlib.sha256).hexdigest()
+    return f"{issued_at}.{signature}"
+
+
+def _secure_cookie_required(request, settings):
+    return (settings["secure_cookie"] or request.secure
+            or (_request_uses_trusted_proxy(request)
+                and request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+                == "https"))
+
+
+def _set_admin_session_cookie(response, request, settings):
+    response.set_cookie(
+        AUTH_COOKIE_NAME, _admin_session_token(settings), max_age=30 * 24 * 60 * 60,
+        httponly=True, secure=_secure_cookie_required(request, settings),
+        samesite="Strict", path="/",
+    )
+
+
+def _set_scanner_session_cookie(response, request, settings):
+    response.set_cookie(
+        SCANNER_COOKIE_NAME, _scanner_session_token(settings), max_age=24 * 60 * 60,
+        httponly=True, secure=_secure_cookie_required(request, settings),
+        samesite="Strict", path="/",
+    )
+
+
+async def _close_admin_sessions(app, *, rotate_secret=True):
+    if rotate_secret:
+        app["runtime_config"]["session_secret"] = secrets.token_bytes(32)
+    clients = getattr(hub, "clients", set())
+    sockets = list(clients)
+    for socket in sockets:
+        clients.discard(socket)
+    if sockets:
+        await asyncio.gather(
+            *(socket.close(code=4001, message=b"admin session changed") for socket in sockets),
+            return_exceptions=True,
+        )
+
+
+def _request_cookie_is_valid(request, cookie_name, token_factory, max_age):
+    supplied = request.cookies.get(cookie_name, "")
+    try:
+        issued_text, _ = supplied.split(".", 1)
+        issued_at = int(issued_text)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    age = int(time.time()) - issued_at
+    if age < -300 or age > max_age:
+        return False
+    return hmac.compare_digest(
+        supplied, token_factory(request.app["runtime_config"], issued_at),
+    )
+
+
+def _request_is_authenticated(request):
+    settings = request.app["runtime_config"]
+    if not settings["auth_enabled"]:
+        return True
+    return _request_cookie_is_valid(
+        request, AUTH_COOKIE_NAME, _admin_session_token, 30 * 24 * 60 * 60,
+    )
+
+
+def _request_is_scanner_authenticated(request):
+    settings = request.app["runtime_config"]
+    return bool(settings.get("scanner_enabled")) and _request_cookie_is_valid(
+        request, SCANNER_COOKIE_NAME, _scanner_session_token, 24 * 60 * 60,
+    )
+
+
+def _admin_session_age(request):
+    supplied = request.cookies.get(AUTH_COOKIE_NAME, "")
+    try:
+        issued_at = int(supplied.split(".", 1)[0])
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return max(0, int(time.time()) - issued_at)
+
+
+@web.middleware
+async def admin_auth_middleware(request, handler):
+    public_requests = {
+        ("GET", "/"), ("GET", "/scan"), ("GET", "/api/health"),
+        ("GET", "/api/auth/status"), ("POST", "/api/auth/login"),
+        ("GET", "/api/scanner/status"), ("POST", "/api/scanner/login"),
+    }
+    scanner_requests = {
+        ("POST", "/api/accounts/scan-all"), ("POST", "/api/scanner/logout"),
+    }
+    request_key = (request.method, request.path)
+    settings = request.app["runtime_config"]
+    if request_key in public_requests or (
+            request.method == "GET" and request.path.startswith("/vendor/")):
+        return await handler(request)
+    if (request_key in scanner_requests
+            and (_request_is_authenticated(request)
+                 or _request_is_scanner_authenticated(request))):
+        return await handler(request)
+    if not settings["auth_enabled"] or _request_is_authenticated(request):
+        return await handler(request)
+    return web.json_response(
+        {"ok": False, "message": "管理员登录已失效，请重新登录"},
+        status=401,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@web.middleware
+async def csrf_origin_middleware(request, handler):
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        origin_error = _local_origin_request_error(request)
+        if origin_error is not None:
+            return origin_error
+    return await handler(request)
+
+
+@web.middleware
+async def security_headers_middleware(request, handler):
+    response = await handler(request)
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; "
+        "media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; "
+        "base-uri 'none'; form-action 'self'",
+    )
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(), geolocation=()")
+    return response
 
 
 def _refresh_legacy_aliases():
@@ -1207,6 +1844,297 @@ async def index(request):
     return web.FileResponse(ROOT / "static" / "index.html", headers={"Cache-Control": "no-store"})
 
 
+async def scanner_page(request):
+    return web.FileResponse(ROOT / "static" / "scan.html", headers={"Cache-Control": "no-store"})
+
+
+async def api_auth_status(request):
+    settings = request.app["runtime_config"]
+    return web.json_response({
+        "required": settings["auth_enabled"],
+        "authenticated": _request_is_authenticated(request),
+    }, headers={"Cache-Control": "no-store"})
+
+
+async def api_health(request):
+    return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
+
+
+async def api_auth_login(request):
+    request_error = _local_json_request_error(request)
+    if request_error is not None:
+        return request_error
+    body = await request.json()
+    if not isinstance(body, dict) or set(body) != {"username", "password"}:
+        raise ValueError("管理员登录需要 username 和 password")
+    username = body.get("username")
+    password = body.get("password")
+    if (not isinstance(username, str) or not isinstance(password, str)
+            or len(username) > 128 or len(password) > 256):
+        raise ValueError("管理员账号或密码无效")
+
+    settings = request.app["runtime_config"]
+    if not settings["auth_enabled"]:
+        return web.json_response({"ok": True, "required": False, "authenticated": True},
+                                 headers={"Cache-Control": "no-store"})
+
+    remote = _request_client_id(request)
+    now = time.monotonic()
+    async with request.app["auth_lock"]:
+        failures = request.app["auth_failures"]
+        if len(failures) >= 1024:
+            stale = [key for key, value in failures.items()
+                     if now - value.get("last_seen", 0.0) > 600]
+            for key in stale:
+                failures.pop(key, None)
+            while len(failures) >= 1024:
+                failures.pop(next(iter(failures)))
+        state = failures.get(remote, {
+            "count": 0, "blocked_until": 0.0, "last_seen": now,
+        })
+        state["last_seen"] = now
+        if state["blocked_until"] > now:
+            return web.json_response(
+                {"ok": False, "message": "登录尝试过于频繁，请稍后再试"},
+                status=429, headers={"Cache-Control": "no-store"},
+            )
+        valid_user = hmac.compare_digest(
+            username.encode("utf-8"), settings["username"].encode("utf-8")
+        )
+        valid_password = await asyncio.to_thread(_admin_password_matches, settings, password)
+        if not (valid_user and valid_password):
+            state["count"] += 1
+            if state["count"] >= 5:
+                state = {"count": 0, "blocked_until": now + 60, "last_seen": now}
+            failures[remote] = state
+            return web.json_response(
+                {"ok": False, "message": "管理员账号或密码错误"},
+                status=401, headers={"Cache-Control": "no-store"},
+            )
+        failures.pop(remote, None)
+        response = web.json_response(
+            {"ok": True, "authenticated": True},
+            headers={"Cache-Control": "no-store"},
+        )
+        _set_admin_session_cookie(response, request, settings)
+        return response
+
+
+async def api_auth_logout(request):
+    request_error = _local_json_request_error(request)
+    if request_error is not None:
+        return request_error
+    await request.json()
+    async with request.app["auth_lock"]:
+        if not _request_is_authenticated(request):
+            return web.json_response(
+                {"ok": False, "message": "管理员登录已失效，请重新登录"}, status=401,
+            )
+        await _close_admin_sessions(request.app)
+    response = web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
+    response.del_cookie(AUTH_COOKIE_NAME, path="/")
+    return response
+
+
+async def api_scanner_status(request):
+    settings = request.app["runtime_config"]
+    admin_authenticated = _request_is_authenticated(request)
+    return web.json_response({
+        "configured": bool(settings.get("scanner_enabled")),
+        "authenticated": (admin_authenticated
+                          or _request_is_scanner_authenticated(request)),
+        "admin": admin_authenticated,
+    }, headers={"Cache-Control": "no-store"})
+
+
+async def api_scanner_login(request):
+    request_error = _local_json_request_error(request)
+    if request_error is not None:
+        return request_error
+    body = await request.json()
+    if not isinstance(body, dict) or set(body) != {"password"}:
+        raise ValueError("扫码页登录需要 password")
+    password = body.get("password")
+    if not isinstance(password, str) or len(password) > 128:
+        raise ValueError("扫码页密码无效")
+    settings = request.app["runtime_config"]
+    if not settings.get("scanner_enabled"):
+        return web.json_response(
+            {"ok": False, "message": "管理员尚未配置扫码页密码"}, status=409,
+        )
+
+    remote = _request_client_id(request)
+    now = time.monotonic()
+    async with request.app["scanner_auth_lock"]:
+        failures = request.app["scanner_auth_failures"]
+        if len(failures) >= 1024:
+            stale = [key for key, value in failures.items()
+                     if now - value.get("last_seen", 0.0) > 600]
+            for key in stale:
+                failures.pop(key, None)
+            while len(failures) >= 1024:
+                failures.pop(next(iter(failures)))
+        state = failures.get(remote, {
+            "count": 0, "blocked_until": 0.0, "last_seen": now,
+        })
+        state["last_seen"] = now
+        if state["blocked_until"] > now:
+            return web.json_response(
+                {"ok": False, "message": "登录尝试过于频繁，请稍后再试"},
+                status=429, headers={"Cache-Control": "no-store"},
+            )
+        valid = await asyncio.to_thread(_scanner_password_matches, settings, password)
+        if not valid:
+            state["count"] += 1
+            if state["count"] >= 5:
+                state = {"count": 0, "blocked_until": now + 60, "last_seen": now}
+            failures[remote] = state
+            return web.json_response(
+                {"ok": False, "message": "扫码页密码错误"}, status=401,
+                headers={"Cache-Control": "no-store"},
+            )
+        failures.pop(remote, None)
+        response = web.json_response(
+            {"ok": True, "authenticated": True}, headers={"Cache-Control": "no-store"},
+        )
+        _set_scanner_session_cookie(response, request, settings)
+        return response
+
+
+async def api_scanner_logout(request):
+    request_error = _local_json_request_error(request)
+    if request_error is not None:
+        return request_error
+    await request.json()
+    async with request.app["scanner_auth_lock"]:
+        if (not _request_is_authenticated(request)
+                and not _request_is_scanner_authenticated(request)):
+            return web.json_response(
+                {"ok": False, "message": "扫码页登录已失效，请重新登录"}, status=401,
+            )
+        request.app["runtime_config"]["scanner_session_secret"] = secrets.token_bytes(32)
+    response = web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
+    response.del_cookie(SCANNER_COOKIE_NAME, path="/")
+    return response
+
+
+async def api_scanner_credentials(request):
+    request_error = _local_json_request_error(request)
+    if request_error is not None:
+        return request_error
+    body = await request.json()
+    if not isinstance(body, dict) or set(body) != {"new_password"}:
+        raise ValueError("扫码页密码请求字段不完整")
+    password = _validate_scanner_password(body.get("new_password"))
+
+    async with request.app["auth_lock"]:
+        if not _request_is_authenticated(request):
+            return web.json_response(
+                {"ok": False, "message": "管理员登录已失效，请重新登录"}, status=401,
+            )
+        settings = request.app["runtime_config"]
+        if settings["auth_enabled"]:
+            age = _admin_session_age(request)
+            if age is None or age > 10 * 60:
+                return web.json_response(
+                    {"ok": False, "message": "请重新登录后再设置扫码页密码"}, status=403,
+                )
+        async with request.app["scanner_auth_lock"]:
+            async with request.app["config_lock"]:
+                salt = secrets.token_bytes(16)
+                password_hash = await asyncio.to_thread(
+                    _password_digest, password, salt, SCANNER_PASSWORD_ITERATIONS,
+                )
+                scanner_record = {
+                    "password_salt": salt.hex(),
+                    "password_hash": password_hash.hex(),
+                    "password_iterations": SCANNER_PASSWORD_ITERATIONS,
+                }
+                next_cfg = {**cfg, "scanner": scanner_record}
+                save_config(next_cfg)
+                cfg.clear()
+                cfg.update(next_cfg)
+                settings = request.app["runtime_config"]
+                settings.update({
+                    "scanner_enabled": True,
+                    "scanner_password_salt": salt,
+                    "scanner_password_hash": password_hash,
+                    "scanner_password_iterations": SCANNER_PASSWORD_ITERATIONS,
+                    "scanner_session_secret": secrets.token_bytes(32),
+                })
+
+    hub.log("扫码页访问密码已更新", "warn")
+    return web.json_response(
+        {"ok": True, "scanner": public_scanner_config(request)},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def api_admin_credentials(request):
+    request_error = _local_json_request_error(request)
+    if request_error is not None:
+        return request_error
+    body = await request.json()
+    if not isinstance(body, dict) or set(body) != {"new_password"}:
+        raise ValueError("管理员密码请求字段不完整")
+    try:
+        new_password = _validate_admin_password(body.get("new_password"))
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+    async with request.app["auth_lock"]:
+        settings = request.app["runtime_config"]
+        if not _request_is_authenticated(request):
+            return web.json_response(
+                {"ok": False, "message": "管理员登录已失效，请重新登录"}, status=401,
+            )
+        if settings["auth_enabled"]:
+            age = _admin_session_age(request)
+            if age is None or age > 10 * 60:
+                return web.json_response(
+                    {"ok": False, "message": "请重新登录后再修改管理员密码"},
+                    status=403, headers={"Cache-Control": "no-store"},
+                )
+        async with request.app["config_lock"]:
+            username = settings["username"]
+            salt = secrets.token_bytes(16)
+            password_hash = await asyncio.to_thread(
+                _password_digest, new_password, salt, ADMIN_PASSWORD_ITERATIONS,
+            )
+            admin_record = {
+                "username": username,
+                "password_salt": salt.hex(),
+                "password_hash": password_hash.hex(),
+                "password_iterations": ADMIN_PASSWORD_ITERATIONS,
+            }
+            next_cfg = {**cfg, "admin": admin_record}
+            save_config(next_cfg)
+            cfg.clear()
+            cfg.update(next_cfg)
+            settings.update({
+                "auth_enabled": True,
+                "username": username,
+                "password": "",
+                "password_salt": salt,
+                "password_hash": password_hash,
+                "password_iterations": ADMIN_PASSWORD_ITERATIONS,
+                "session_secret": secrets.token_bytes(32),
+            })
+
+        await _close_admin_sessions(request.app, rotate_secret=False)
+        hub.log("管理员账号凭据已更新", "warn")
+        response = web.json_response(
+            {"ok": True, "admin": {
+                "username": username,
+                "password_required": True,
+                "reset_mode": bool(settings.get("admin_reset", False)),
+            }},
+            headers={"Cache-Control": "no-store"},
+        )
+        _set_admin_session_cookie(response, request, settings)
+        return response
+
+
 async def _cancel_restore(app):
     task = app.get("restore_task")
     if not task or task.done() or task is asyncio.current_task():
@@ -1237,6 +2165,10 @@ async def ws_handler(request):
         return origin_error
     ws = web.WebSocketResponse(heartbeat=25)
     await ws.prepare(request)
+    if (request.app["runtime_config"]["auth_enabled"]
+            and not _request_is_authenticated(request)):
+        await ws.close(code=4001, message=b"admin session expired")
+        return ws
     hub.clients.add(ws)
     for m in list(hub.history)[-120:]:
         try:
@@ -1520,6 +2452,65 @@ async def api_account_remove(request):
     return web.json_response({"ok": True})
 
 
+async def api_accounts_scan_all(request):
+    request_error = _local_json_request_error(request)
+    if request_error is not None:
+        return request_error
+    admin_request = _request_is_authenticated(request)
+    if not admin_request and not request.headers.get("Origin"):
+        return web.json_response(
+            {"ok": False, "message": "扫码请求缺少同源标识"}, status=403,
+        )
+    body = await request.json()
+    if not isinstance(body, dict) or set(body) != {"qr_content"}:
+        raise ValueError("扫码签到请求需要 qr_content")
+    qr_content = body.get("qr_content")
+    if not isinstance(qr_content, str):
+        raise ValueError("二维码内容必须是字符串")
+    qr_content = core.validate_checkin_qr_url(qr_content)
+    if account_manager is None or not account_manager.accounts:
+        return web.json_response(
+            {"ok": False, "message": "没有可签到的已登录账号"}, status=409,
+        )
+    scan_lock = request.app["scan_lock"]
+    if scan_lock.locked():
+        return web.json_response(
+            {"ok": False, "message": "已有扫码签到任务正在执行"}, status=409,
+        )
+    now = time.monotonic()
+    if now - request.app["last_scan_at"] < 2:
+        return web.json_response(
+            {"ok": False, "message": "扫码签到过于频繁，请稍后再试"}, status=429,
+        )
+    async with scan_lock:
+        result = await account_manager.scan_all(qr_content)
+        request.app["last_scan_at"] = time.monotonic()
+    hub.log(f"扫码签到完成: {result['success']}/{result['total']} 个账号成功")
+    if admin_request:
+        return web.json_response({"ok": True, **result})
+
+    failures = {}
+    for item in result["results"]:
+        if item.get("ok"):
+            continue
+        if item.get("status") == "not_enrolled":
+            reason = "not_enrolled"
+        elif str(item.get("code")) == "51203":
+            reason = "expired"
+        elif "授权" in str(item.get("message") or ""):
+            reason = "authorization"
+        else:
+            reason = "failed"
+        failures[reason] = failures.get(reason, 0) + 1
+    return web.json_response({
+        "ok": True,
+        "total": result["total"],
+        "success": result["success"],
+        "failed": result["total"] - result["success"],
+        "failures": failures,
+    })
+
+
 def _local_json_request_error(request):
     if getattr(request, "content_type", "") != "application/json":
         return web.json_response({"ok": False, "message": "请求必须使用 application/json"},
@@ -1527,10 +2518,42 @@ def _local_json_request_error(request):
     return _local_origin_request_error(request)
 
 
+def _request_uses_trusted_proxy(request):
+    runtime = getattr(request, "app", {}).get("runtime_config", {})
+    if not runtime.get("trust_proxy"):
+        return False
+    remote = str(getattr(request, "remote", "") or "")
+    try:
+        return ipaddress.ip_address(remote).is_loopback
+    except ValueError:
+        return remote == "localhost"
+
+
+def _request_client_id(request):
+    if _request_uses_trusted_proxy(request):
+        forwarded = request.headers.get("X-Forwarded-For", "").rsplit(",", 1)[-1].strip()
+        try:
+            return str(ipaddress.ip_address(forwarded))
+        except ValueError:
+            pass
+    return str(getattr(request, "remote", None) or "unknown")
+
+
 def _local_origin_request_error(request):
     origin = getattr(request, "headers", {}).get("Origin")
     if origin:
-        expected_origin = f"{request.scheme}://{request.host}"
+        scheme = request.scheme
+        host = request.host
+        if _request_uses_trusted_proxy(request):
+            forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+            forwarded_host = request.headers.get("X-Forwarded-Host", "").split(",", 1)[0].strip()
+            if forwarded_proto in ("http", "https"):
+                scheme = forwarded_proto
+            if (forwarded_host and len(forwarded_host) <= 253
+                    and not any(char.isspace() or ord(char) < 32 for char in forwarded_host)
+                    and "/" not in forwarded_host):
+                host = forwarded_host
+        expected_origin = f"{scheme}://{host}"
         if origin.rstrip("/") != expected_origin.rstrip("/"):
             return web.json_response({"ok": False, "message": "拒绝跨站请求"}, status=403)
     return None
@@ -1554,12 +2577,14 @@ async def api_config(request):
             **cfg,
             "llm": dict(cfg.get("llm", {})),
             "lesson": dict(cfg.get("lesson", {})),
+            "email": dict(cfg.get("email", emailer.DEFAULT_EMAIL_SETTINGS)),
             "bot": dict(cfg.get("bot", {})),
         }
         changed = False
         dry_run_changed = False
         auto_start_changed = False
         llm_changed = False
+        email_changed = False
         if "auto_answer" in body and "dry_run" in body:
             raise ValueError("auto_answer 与 dry_run 不能同时设置")
         if "auto_answer" in body or "dry_run" in body:
@@ -1627,6 +2652,13 @@ async def api_config(request):
                 next_llm["api_key"] = replacement_key
             changed = changed or llm_changed
 
+        if "email" in body:
+            current_email = next_cfg["email"]
+            next_email = emailer.merge_email_settings(current_email, body["email"])
+            email_changed = next_email != current_email
+            next_cfg["email"] = next_email
+            changed = changed or email_changed
+
         candidate_solver = (core.LLMSolver(next_cfg, llm_session)
                             if llm_changed else solver)
         if changed:
@@ -1640,6 +2672,8 @@ async def api_config(request):
                     account_manager.set_solver(candidate_solver)
                 elif watcher is not None:
                     watcher.solver = candidate_solver
+            if email_changed and account_manager is not None:
+                account_manager.set_email_config(next_cfg["email"])
             config_revision += 1
             if dry_run_changed:
                 enabled = not cfg["bot"]["dry_run"]
@@ -1649,9 +2683,14 @@ async def api_config(request):
                 hub.log("登录后自动监课 => " + str(cfg["bot"]["auto_start_watching"]))
             if llm_changed:
                 hub.log(f"模型配置已更新: {cfg['llm']['model']}")
+            if email_changed:
+                hub.log("邮件通知配置已更新")
             await hub.sync_state()
         response = {"ok": True, "manual_checkin": True,
-                    "revision": config_revision, "llm": public_llm_config(next_cfg)}
+                    "revision": config_revision, "llm": public_llm_config(next_cfg),
+                    "email": public_email_config(next_cfg),
+                    "admin": public_admin_config(request, next_cfg),
+                    "scanner": public_scanner_config(request, next_cfg)}
     return web.json_response(response, headers={"Cache-Control": "no-store"})
 
 
@@ -1662,7 +2701,30 @@ async def api_config_get(request):
         "auto_start_watching": cfg["bot"].get("auto_start_watching", True),
         "revision": config_revision,
         "llm": public_llm_config(),
+        "email": public_email_config(),
+        "admin": public_admin_config(request),
+        "scanner": public_scanner_config(request),
     }, headers={"Cache-Control": "no-store"})
+
+
+async def api_email_test(request):
+    request_error = _local_json_request_error(request)
+    if request_error is not None:
+        return request_error
+    body = await request.json()
+    if body != {}:
+        raise ValueError("测试邮件请求不接受配置字段，请先保存邮件配置")
+    notifier = (account_manager.notifier if account_manager is not None
+                else emailer.EmailNotifier(cfg.get("email", {}), hub.log))
+    try:
+        await notifier.send_test()
+    except emailer.EmailTestCooldownError as exc:
+        return web.json_response({"ok": False, "message": str(exc)}, status=429)
+    except emailer.EmailNotificationError as exc:
+        hub.log(f"测试邮件发送失败: {exc}", "error")
+        return web.json_response({"ok": False, "message": str(exc)}, status=502)
+    return web.json_response({"ok": True, "message": "测试邮件已发送"},
+                             headers={"Cache-Control": "no-store"})
 
 
 async def api_llm_models(request):
@@ -1767,9 +2829,30 @@ async def on_cleanup(app):
 
 
 def make_app() -> web.Application:
-    app = web.Application(middlewares=[api_error_middleware])
+    app = web.Application(middlewares=[
+        security_headers_middleware, admin_auth_middleware,
+        csrf_origin_middleware, api_error_middleware,
+    ])
+    app["runtime_config"] = server_runtime_config(config=cfg)
+    app["auth_lock"] = asyncio.Lock()
+    app["auth_failures"] = {}
+    app["scanner_auth_lock"] = asyncio.Lock()
+    app["scanner_auth_failures"] = {}
+    app["scan_lock"] = asyncio.Lock()
+    app["last_scan_at"] = 0.0
     app["config_lock"] = asyncio.Lock()
     app.router.add_get("/", index)
+    app.router.add_get("/scan", scanner_page)
+    app.router.add_static("/vendor/", ROOT / "static" / "vendor", show_index=False)
+    app.router.add_get("/api/health", api_health)
+    app.router.add_get("/api/auth/status", api_auth_status)
+    app.router.add_post("/api/auth/login", api_auth_login)
+    app.router.add_post("/api/auth/logout", api_auth_logout)
+    app.router.add_post("/api/admin/credentials", api_admin_credentials)
+    app.router.add_get("/api/scanner/status", api_scanner_status)
+    app.router.add_post("/api/scanner/login", api_scanner_login)
+    app.router.add_post("/api/scanner/logout", api_scanner_logout)
+    app.router.add_post("/api/scanner/credentials", api_scanner_credentials)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/api/state", api_state)
     app.router.add_post("/api/login/qr/start", api_login_qr_start)
@@ -1783,14 +2866,18 @@ def make_app() -> web.Application:
     app.router.add_post("/api/accounts/{account_id}/watch/stop", api_account_watch_stop)
     app.router.add_post("/api/accounts/{account_id}/watch/join", api_account_watch_join)
     app.router.add_post("/api/accounts/{account_id}/remove", api_account_remove)
+    app.router.add_post("/api/accounts/scan-all", api_accounts_scan_all)
     app.router.add_get("/api/config", api_config_get)
     app.router.add_post("/api/config", api_config)
     app.router.add_post("/api/config/llm/models", api_llm_models)
+    app.router.add_post("/api/config/email/test", api_email_test)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
 
 
 if __name__ == "__main__":
-    print("雨课堂自动答题面板: http://127.0.0.1:8765")
-    web.run_app(make_app(), host="127.0.0.1", port=8765, print=None)
+    runtime = server_runtime_config(config=cfg)
+    display_host = "127.0.0.1" if runtime["host"] in ("0.0.0.0", "::") else runtime["host"]
+    print(f"雨课堂自动答题面板: http://{display_host}:{runtime['port']}")
+    web.run_app(make_app(), host=runtime["host"], port=runtime["port"], print=None)

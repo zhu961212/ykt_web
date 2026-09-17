@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import json
+import os
+import stat
 import tempfile
 import time
 import unittest
@@ -26,6 +28,17 @@ def config(*, dry_run=True):
             "vision_enabled": False,
         },
         "lesson": {"poll_interval": 0.01},
+        "email": {
+            "enabled": False,
+            "smtp_host": "",
+            "smtp_port": 465,
+            "security": "ssl",
+            "username": "",
+            "password": "",
+            "from_address": "",
+            "to_address": "",
+            "cooldown_seconds": 900,
+        },
         "bot": {
             "dry_run": dry_run,
             "wait_manual_checkin": True,
@@ -80,13 +93,19 @@ class FakePanel:
 
 class FakeRequest:
     def __init__(self, body=None, *, content_type="application/json", headers=None,
-                 scheme="http", host="127.0.0.1:8765"):
+                 scheme="http", host="127.0.0.1:8765", cookies=None,
+                 remote="127.0.0.1", path="/", method="POST"):
         self.body = {} if body is None else body
         self.app = {}
         self.content_type = content_type
         self.headers = headers or {}
         self.scheme = scheme
         self.host = host
+        self.secure = scheme == "https"
+        self.cookies = cookies or {}
+        self.remote = remote
+        self.path = path
+        self.method = method
 
     async def json(self):
         return self.body
@@ -142,6 +161,45 @@ class ImmediateSolver:
 class BlockingSolver:
     async def solve(self, problem):
         await asyncio.Event().wait()
+
+
+class FakeNotifier:
+    def __init__(self):
+        self.events = []
+
+    async def notify(self, key, subject, body):
+        self.events.append((key, subject, body))
+        return True
+
+    def clear(self, key):
+        return None
+
+    def clear_prefix(self, prefix):
+        return None
+
+
+class GatedSolver:
+    def __init__(self, expected_starts=1, answer_for=None):
+        self.expected_starts = expected_starts
+        self.answer_for = answer_for or (lambda problem: ["A"])
+        self.calls = []
+        self.started = asyncio.Event()
+        self.all_started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+
+    async def solve(self, problem):
+        self.calls.append(problem)
+        self.started.set()
+        if len(self.calls) >= self.expected_starts:
+            self.all_started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        result = list(self.answer_for(problem))
+        return {"result": result, "display": json.dumps(result, ensure_ascii=False)}
 
 
 class CaptureClient(core.YuketangClient):
@@ -1171,6 +1229,16 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             "GET", "/api/v3/classroom/on-lesson-upcoming-exam"
         )
 
+    async def test_get_on_lesson_reports_explicit_authorization_loss(self):
+        client = core.YuketangClient({"server": "yuketang"}, object())
+        request = mock.AsyncMock(return_value=(401, {}, {"code": 401}))
+
+        with mock.patch.object(client, "_req", request):
+            with self.assertRaises(core.AuthenticationExpired):
+                await client.get_on_lesson()
+
+        self.assertTrue(client.lesson_discovery["latest"]["auth_expired"])
+
     async def test_get_on_lesson_rejects_missing_classroom_list(self):
         client = core.YuketangClient({"server": "yuketang"}, object())
         request = mock.AsyncMock(return_value=(200, {}, {
@@ -1263,6 +1331,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             "code": 0,
             "data": {"lessonToken": "fresh-lesson"},
         })
+        response.status = 200
         response.headers = {"set-auth": "fresh-bearer"}
         http = mock.MagicMock()
         http.post.return_value = response
@@ -1284,6 +1353,74 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             "lessonId": "lesson-1",
             "joinIfNotIn": False,
         })
+
+    async def test_checkin_reports_explicit_authorization_loss(self):
+        response = mock.MagicMock()
+        response.__aenter__ = mock.AsyncMock(return_value=response)
+        response.__aexit__ = mock.AsyncMock(return_value=None)
+        response.status = 403
+        response.json = mock.AsyncMock(side_effect=ValueError("HTML response"))
+        http = mock.MagicMock()
+        http.post.return_value = response
+        client = core.YuketangClient({"server": "yuketang"}, http)
+
+        with self.assertRaises(core.AuthenticationExpired):
+            await client.checkin("lesson-1")
+
+    async def test_scan_qr_reports_explicit_authorization_loss(self):
+        client = core.YuketangClient({"server": "yuketang"}, object())
+        with mock.patch.object(
+            client, "_req", mock.AsyncMock(return_value=(401, {}, None)),
+        ):
+            with self.assertRaises(core.AuthenticationExpired):
+                await client.scan_qr(
+                    "https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?code=x"
+                )
+
+    def test_checkin_qr_url_accepts_only_yuketang_dynamic_codes(self):
+        valid = (
+            "https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?code=x"
+        )
+        self.assertEqual(core.validate_checkin_qr_url(valid), valid)
+
+        invalid = (
+            "http://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?code=x",
+            "https://evil.example/api/v3/lesson/check-in/dynamic-qr-code?code=x",
+            "https://www.yuketang.cn/api/v3/lesson/checkin?code=x",
+            "https://www.yuketang.cn:443/api/v3/lesson/check-in/dynamic-qr-code?code=x",
+            "https://user:pass@www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?code=x",
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                core.validate_checkin_qr_url(value)
+
+    async def test_scan_qr_reports_expired_dynamic_code(self):
+        client = core.YuketangClient({"server": "yuketang"}, object())
+        with mock.patch.object(
+            client, "_req", mock.AsyncMock(return_value=(200, {}, {"code": 51203})),
+        ):
+            with self.assertRaises(core.QRCodeScanError) as raised:
+                await client.scan_qr(
+                    "https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?code=x"
+                )
+
+        self.assertEqual(raised.exception.code, 51203)
+        self.assertIn("过期", str(raised.exception))
+
+    async def test_scan_qr_uses_cookie_auth_and_returns_lesson_id(self):
+        client = core.YuketangClient({"server": "yuketang"}, object())
+        request = mock.AsyncMock(return_value=(200, {}, {
+            "code": 0, "data": {"type": "checkin", "value": 12345},
+        }))
+        qr_url = "https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?c=x&t=1&s=y&v=2"
+
+        with mock.patch.object(client, "_req", request):
+            lesson_id = await client.scan_qr(qr_url)
+
+        self.assertEqual(lesson_id, "12345")
+        request.assert_awaited_once_with(
+            "POST", "/api/v3/app/scan", json={"url": qr_url}, with_bearer=False,
+        )
 
     async def test_adopt_login_copies_only_rainclassroom_cookies(self):
         async with aiohttp.ClientSession() as main_http, aiohttp.ClientSession() as qr_http:
@@ -1316,6 +1453,304 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((main.user_id, main.user_name), ("qr-user", "QR User"))
 
 
+class AdminAuthTests(unittest.IsolatedAsyncioTestCase):
+    def test_remote_listener_requires_strong_admin_password(self):
+        with self.assertRaisesRegex(RuntimeError, "至少 12 位"):
+            server.server_runtime_config({"YKT_HOST": "0.0.0.0"})
+        with self.assertRaisesRegex(RuntimeError, "至少 12 位"):
+            server.server_runtime_config({"YKT_HOST": "127.0.0.1", "YKT_TRUST_PROXY": "1"})
+
+        settings = server.server_runtime_config({
+            "YKT_HOST": "0.0.0.0",
+            "YKT_PORT": "9000",
+            "YKT_ADMIN_USERNAME": "owner",
+            "YKT_ADMIN_PASSWORD": "strong-password-123",
+        })
+
+        self.assertEqual(settings["host"], "0.0.0.0")
+        self.assertEqual(settings["port"], 9000)
+        self.assertTrue(settings["auth_enabled"])
+        self.assertEqual(settings["username"], "owner")
+
+    async def test_admin_login_sets_http_only_session_cookie(self):
+        settings = server.server_runtime_config({
+            "YKT_HOST": "0.0.0.0",
+            "YKT_ADMIN_USERNAME": "owner",
+            "YKT_ADMIN_PASSWORD": "strong-password-123",
+        })
+        app = {
+            "runtime_config": settings,
+            "auth_lock": asyncio.Lock(),
+            "auth_failures": {},
+        }
+        request = FakeRequest({
+            "username": "owner", "password": "strong-password-123",
+        }, path="/api/auth/login")
+        request.app = app
+
+        response = await server.api_auth_login(request)
+
+        cookie = response.cookies[server.AUTH_COOKIE_NAME]
+        self.assertEqual(response.status, 200)
+        self.assertTrue(cookie["httponly"])
+        self.assertEqual(cookie["samesite"], "Strict")
+        self.assertNotIn("strong-password-123", response.text)
+
+        status_request = FakeRequest(
+            cookies={server.AUTH_COOKIE_NAME: cookie.value}, path="/api/auth/status",
+        )
+        status_request.app = app
+        payload = json.loads((await server.api_auth_status(status_request)).text)
+        self.assertTrue(payload["required"])
+        self.assertTrue(payload["authenticated"])
+
+    async def test_admin_middleware_rejects_unauthenticated_api(self):
+        settings = server.server_runtime_config({
+            "YKT_HOST": "0.0.0.0",
+            "YKT_ADMIN_PASSWORD": "strong-password-123",
+        })
+        request = FakeRequest(path="/api/state")
+        request.app = {"runtime_config": settings}
+        handler = mock.AsyncMock()
+
+        response = await server.admin_auth_middleware(request, handler)
+
+        self.assertEqual(response.status, 401)
+        handler.assert_not_awaited()
+
+    def test_admin_session_expiry_is_enforced_by_server(self):
+        settings = server.server_runtime_config({
+            "YKT_HOST": "0.0.0.0",
+            "YKT_ADMIN_PASSWORD": "strong-password-123",
+        })
+        expired = server._admin_session_token(
+            settings, int(time.time()) - 31 * 24 * 60 * 60,
+        )
+        request = FakeRequest(cookies={server.AUTH_COOKIE_NAME: expired})
+        request.app = {"runtime_config": settings}
+
+        self.assertFalse(server._request_is_authenticated(request))
+
+    async def test_admin_logout_invalidates_copied_session_token(self):
+        settings = server.server_runtime_config({
+            "YKT_HOST": "0.0.0.0",
+            "YKT_ADMIN_PASSWORD": "strong-password-123",
+        })
+        token = server._admin_session_token(settings)
+        app = {"runtime_config": settings, "auth_lock": asyncio.Lock()}
+        request = FakeRequest({}, cookies={server.AUTH_COOKIE_NAME: token})
+        request.app = app
+        self.assertTrue(server._request_is_authenticated(request))
+
+        await server.api_auth_logout(request)
+
+        self.assertFalse(server._request_is_authenticated(request))
+
+    async def test_csrf_origin_supports_explicit_local_tls_proxy_only(self):
+        runtime = server.server_runtime_config({
+            "YKT_HOST": "127.0.0.1",
+            "YKT_TRUST_PROXY": "1",
+            "YKT_ADMIN_PASSWORD": "strong-password-123",
+        })
+        headers = {
+            "Origin": "https://panel.example",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "panel.example",
+            "X-Forwarded-For": "203.0.113.9, 198.51.100.24",
+        }
+        request = FakeRequest(
+            headers=headers, scheme="http", host="127.0.0.1:8765",
+            remote="127.0.0.1", path="/api/config", method="POST",
+        )
+        request.app = {"runtime_config": runtime}
+        handler = mock.AsyncMock(return_value=server.web.Response(status=204))
+
+        response = await server.csrf_origin_middleware(request, handler)
+
+        self.assertEqual(response.status, 204)
+        handler.assert_awaited_once_with(request)
+        self.assertEqual(server._request_client_id(request), "198.51.100.24")
+
+        request.remote = "192.0.2.10"
+        rejected = await server.csrf_origin_middleware(request, handler)
+        self.assertEqual(rejected.status, 403)
+
+    async def test_security_headers_block_framing(self):
+        response = await server.security_headers_middleware(
+            FakeRequest(method="GET"),
+            mock.AsyncMock(return_value=server.web.Response(status=200)),
+        )
+
+        self.assertEqual(response.headers["X-Frame-Options"], "DENY")
+        self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
+        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+
+    async def test_admin_password_is_changed_with_a_salted_hash(self):
+        settings = server.server_runtime_config({
+            "YKT_HOST": "0.0.0.0",
+            "YKT_ADMIN_USERNAME": "admin",
+            "YKT_ADMIN_PASSWORD": "old-password-123",
+        })
+        app = {
+            "runtime_config": settings,
+            "auth_lock": asyncio.Lock(),
+            "scanner_auth_lock": asyncio.Lock(),
+            "config_lock": asyncio.Lock(),
+        }
+        request = FakeRequest({
+            "new_password": "new-password-456",
+        }, path="/api/admin/credentials", cookies={
+            server.AUTH_COOKIE_NAME: server._admin_session_token(settings),
+        })
+        request.app = app
+        test_cfg = config()
+        test_hub = FakeHub()
+
+        with mock.patch.object(server, "cfg", test_cfg), \
+                mock.patch.object(server, "hub", test_hub), \
+                mock.patch.object(server, "save_config") as save:
+            response = await server.api_admin_credentials(request)
+
+        persisted = save.call_args.args[0]["admin"]
+        self.assertEqual(response.status, 200)
+        self.assertEqual(persisted["username"], "admin")
+        self.assertNotIn("old-password-123", json.dumps(persisted))
+        self.assertNotIn("new-password-456", json.dumps(persisted))
+        self.assertTrue(server._admin_password_matches(settings, "new-password-456"))
+        self.assertFalse(server._admin_password_matches(settings, "old-password-123"))
+        self.assertNotIn("password_hash", response.text)
+
+        restored = server.server_runtime_config(
+            {"YKT_HOST": "0.0.0.0"}, {**test_cfg, "admin": persisted},
+        )
+        self.assertEqual(restored["username"], "admin")
+        self.assertTrue(server._admin_password_matches(restored, "new-password-456"))
+
+    async def test_scanner_login_cookie_cannot_access_admin_apis(self):
+        salt = b"s" * 16
+        scanner_password = "scan-pass-123"
+        scanner_record = {
+            "password_salt": salt.hex(),
+            "password_hash": server._password_digest(
+                scanner_password, salt, server.SCANNER_PASSWORD_ITERATIONS,
+            ).hex(),
+            "password_iterations": server.SCANNER_PASSWORD_ITERATIONS,
+        }
+        settings = server.server_runtime_config({
+            "YKT_HOST": "0.0.0.0", "YKT_ADMIN_PASSWORD": "admin-pass-123",
+        }, {"scanner": scanner_record})
+        app = {
+            "runtime_config": settings,
+            "scanner_auth_lock": asyncio.Lock(),
+            "scanner_auth_failures": {},
+        }
+        login = FakeRequest({"password": scanner_password}, path="/api/scanner/login")
+        login.app = app
+
+        response = await server.api_scanner_login(login)
+        scanner_cookie = response.cookies[server.SCANNER_COOKIE_NAME].value
+        self.assertNotIn(scanner_password, response.text)
+
+        scan_request = FakeRequest(
+            path="/api/accounts/scan-all", method="POST",
+            cookies={server.SCANNER_COOKIE_NAME: scanner_cookie},
+        )
+        scan_request.app = app
+        handler = mock.AsyncMock(return_value=server.web.Response(status=204))
+        allowed = await server.admin_auth_middleware(scan_request, handler)
+        self.assertEqual(allowed.status, 204)
+
+        admin_request = FakeRequest(
+            path="/api/config", method="GET",
+            cookies={server.SCANNER_COOKIE_NAME: scanner_cookie},
+        )
+        admin_request.app = app
+        rejected = await server.admin_auth_middleware(admin_request, handler)
+        self.assertEqual(rejected.status, 401)
+
+    async def test_admin_can_set_scanner_password_without_storing_plaintext(self):
+        settings = server.server_runtime_config({
+            "YKT_HOST": "0.0.0.0", "YKT_ADMIN_PASSWORD": "admin-pass-123",
+        })
+        admin_token = server._admin_session_token(settings)
+        app = {
+            "runtime_config": settings,
+            "auth_lock": asyncio.Lock(),
+            "scanner_auth_lock": asyncio.Lock(),
+            "config_lock": asyncio.Lock(),
+        }
+        request = FakeRequest(
+            {"new_password": "scanner-pass-123"},
+            path="/api/scanner/credentials",
+            cookies={server.AUTH_COOKIE_NAME: admin_token},
+        )
+        request.app = app
+        test_cfg = config()
+
+        with mock.patch.object(server, "cfg", test_cfg), \
+                mock.patch.object(server, "hub", FakeHub()), \
+                mock.patch.object(server, "save_config") as save:
+            response = await server.api_scanner_credentials(request)
+
+        persisted = save.call_args.args[0]["scanner"]
+        self.assertTrue(settings["scanner_enabled"])
+        self.assertTrue(server._scanner_password_matches(settings, "scanner-pass-123"))
+        self.assertNotIn("scanner-pass-123", json.dumps(persisted))
+        self.assertNotIn("password_hash", response.text)
+
+    async def test_scanner_scan_response_redacts_account_details(self):
+        salt = b"r" * 16
+        password = "scanner-pass-123"
+        scanner_record = {
+            "password_salt": salt.hex(),
+            "password_hash": server._password_digest(
+                password, salt, server.SCANNER_PASSWORD_ITERATIONS,
+            ).hex(),
+            "password_iterations": server.SCANNER_PASSWORD_ITERATIONS,
+        }
+        settings = server.server_runtime_config({
+            "YKT_HOST": "0.0.0.0", "YKT_ADMIN_PASSWORD": "admin-pass-123",
+        }, {"scanner": scanner_record})
+        scanner_cookie = server._scanner_session_token(settings)
+        fake_manager = mock.MagicMock()
+        fake_manager.accounts = {"secret-account": object()}
+        fake_manager.scan_all = mock.AsyncMock(return_value={
+            "total": 2,
+            "success": 1,
+            "results": [
+                {"ok": True, "account_id": "secret-1", "account_name": "Alice",
+                 "lesson_id": "lesson-secret"},
+                {"ok": False, "account_id": "secret-2", "account_name": "Bob",
+                 "status": "not_enrolled", "message": "账号未加入该课程"},
+            ],
+        })
+        request = FakeRequest(
+            {"qr_content": (
+                "https://www.yuketang.cn/api/v3/lesson/check-in/"
+                "dynamic-qr-code?c=x&t=1&s=y&v=2"
+            )},
+            headers={"Origin": "http://127.0.0.1:8765"},
+            path="/api/accounts/scan-all",
+            cookies={server.SCANNER_COOKIE_NAME: scanner_cookie},
+        )
+        request.app = {
+            "runtime_config": settings,
+            "scan_lock": asyncio.Lock(),
+            "last_scan_at": 0.0,
+        }
+
+        with mock.patch.object(server, "account_manager", fake_manager), \
+                mock.patch.object(server, "hub", FakeHub()):
+            response = await server.api_accounts_scan_all(request)
+
+        payload = json.loads(response.text)
+        self.assertEqual(payload["success"], 1)
+        self.assertEqual(payload["failures"], {"not_enrolled": 1})
+        self.assertNotIn("secret", response.text)
+        self.assertNotIn("Alice", response.text)
+        self.assertNotIn("Bob", response.text)
+
+
 class WebSocketOriginTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         names = ("cfg", "hub", "client", "watcher", "account_manager")
@@ -1326,6 +1761,7 @@ class WebSocketOriginTests(unittest.IsolatedAsyncioTestCase):
         server.watcher = FakeLoginWatcher()
         server.account_manager = None
         app = server.web.Application()
+        app["runtime_config"] = server.server_runtime_config()
         app.router.add_get("/ws", server.ws_handler)
         self.http_client = TestClient(TestServer(app))
         await self.http_client.start_server()
@@ -1615,6 +2051,28 @@ class WatcherTests(unittest.IsolatedAsyncioTestCase):
         await self.watcher.stop()
         self.root_patch.stop()
         self.temp_directory.cleanup()
+
+    async def test_authorization_loss_schedules_account_email_notification(self):
+        notifier = FakeNotifier()
+        self.watcher.notifier = notifier
+        self.watcher.running = True
+        self.client.get_on_lesson = mock.AsyncMock(
+            side_effect=core.AuthenticationExpired("HTTP 401")
+        )
+
+        async def stop_retry(_delay):
+            self.watcher.running = False
+
+        with mock.patch.object(server.asyncio, "sleep", new=stop_retry):
+            await self.watcher._run()
+        if self.watcher.background_tasks:
+            await asyncio.gather(*list(self.watcher.background_tasks))
+
+        self.assertEqual(len(notifier.events), 1)
+        key, subject, body = notifier.events[0]
+        self.assertEqual(key, "single:authorization")
+        self.assertIn("授权已失效", subject)
+        self.assertIn("HTTP 401", body)
 
     def test_window_uses_real_start_and_safe_submit_point(self):
         received = 1_700_000_005.0
@@ -2061,6 +2519,8 @@ class PersistenceAndFrontendTests(unittest.TestCase):
         self.assertTrue(loaded["bot"]["dry_run"])
         self.assertFalse(loaded["bot"]["auto_start_watching"])
         self.assertEqual(loaded["llm"]["api_key"], "")
+        self.assertFalse(loaded["email"]["enabled"])
+        self.assertEqual(loaded["email"]["password"], "")
         self.assertTrue(loaded["bot"]["wait_manual_checkin"])
 
     def test_session_is_written_atomically(self):
@@ -2081,6 +2541,8 @@ class PersistenceAndFrontendTests(unittest.TestCase):
                 self.assertEqual(saved["user_id"], "u1")
                 self.assertEqual(saved["cookies"]["x_access_token"], "secret")
                 self.assertFalse(path.with_suffix(".json.tmp").exists())
+                if os.name == "posix":
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_frontend_uses_serial_qr_polling(self):
         html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
@@ -2091,7 +2553,7 @@ class PersistenceAndFrontendTests(unittest.TestCase):
         self.assertIn("message.attempt_id != null && message.attempt_id !== qrAttemptId", html)
         self.assertNotIn("message.attempt_id != null && qrAttemptId != null", html)
         self.assertNotIn("setInterval(async", html)
-        self.assertNotIn("btnScan", html)
+        self.assertNotIn('id="btnScan"', html)
         self.assertIn('poll.status === "refresh"', html)
         self.assertIn("if (restartQr) void qrStart()", html)
         self.assertIn("请使用微信扫码登录", html)
@@ -2167,15 +2629,102 @@ class PersistenceAndFrontendTests(unittest.TestCase):
         self.assertIn("llmFormDirty = false", html)
         self.assertNotIn('keyInput.value = settings.api_key', html)
 
+    def test_frontend_email_form_keeps_password_private_and_tests_saved_config(self):
+        html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn('id="emailForm"', html)
+        self.assertIn('id="emailPassword" type="password"', html)
+        self.assertIn('id="btnTestEmail"', html)
+        self.assertIn('requestJSON("/api/config")', html)
+        self.assertIn("if (password) email.password = password", html)
+        self.assertIn("body:JSON.stringify({email})", html)
+        self.assertIn('requestJSON("/api/config/email/test"', html)
+        self.assertIn("if (!emailFormDirty)", html)
+        self.assertNotIn('$("emailPassword").value = settings.password', html)
+
+    def test_frontend_requires_admin_login_before_starting_panel(self):
+        html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn('id="authGate"', html)
+        self.assertIn('id="authUsername" type="text"', html)
+        self.assertIn('id="authPassword" type="password"', html)
+        self.assertIn('requestJSON("/api/auth/status")', html)
+        self.assertIn('requestJSON("/api/auth/login"', html)
+        self.assertIn('id="btnAdminLogout"', html)
+        self.assertIn('requestJSON("/api/auth/logout"', html)
+        self.assertIn("body:JSON.stringify({username, password})", html)
+        self.assertIn("if (panelBootstrapped) return", html)
+        self.assertNotIn("connectWs();\nrefreshState();", html)
+
+    def test_frontend_has_separate_console_and_settings_views(self):
+        html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn('data-view="console"', html)
+        self.assertIn('data-view="settings"', html)
+        self.assertIn('class="card settings-only"', html)
+        self.assertIn('class="card console-only"', html)
+        self.assertIn("function setPanelView(view)", html)
+        self.assertIn('location.hash === "#settings"', html)
+        self.assertIn('classList.toggle("settings-mode"', html)
+        self.assertIn('id="adminForm"', html)
+        self.assertIn('id="adminNewPassword" type="password"', html)
+        self.assertNotIn('id="adminCurrentPassword"', html)
+        self.assertNotIn('id="adminUsername"', html)
+        self.assertIn('requestJSON("/api/admin/credentials"', html)
+        self.assertIn('id="scannerForm"', html)
+        self.assertIn('requestJSON("/api/scanner/credentials"', html)
+
+    def test_frontend_scan_all_automatically_submits_detected_code(self):
+        static_dir = Path(__file__).parent / "static"
+        admin_html = (static_dir / "index.html").read_text(encoding="utf-8")
+        html = (static_dir / "scan.html").read_text(encoding="utf-8")
+
+        self.assertIn('id="btnScanAll"', admin_html)
+        self.assertIn('window.location.href = "/scan"', admin_html)
+        self.assertNotIn('id="scanDialog"', admin_html)
+        self.assertIn('id="scanVideo"', html)
+        self.assertNotIn('id="scanImage"', html)
+        self.assertNotIn('id="scanContent"', html)
+        self.assertNotIn('id="btnSubmit"', html)
+        self.assertNotIn('$("scanContent")', html)
+        self.assertNotIn('$("btnSubmit")', html)
+        self.assertIn('src="/vendor/jsQR.js"', html)
+        self.assertIn("new BarcodeDetector", html)
+        self.assertIn("window.jsQR", html)
+        self.assertIn("navigator.mediaDevices.getUserMedia", html)
+        self.assertIn('focusMode:"continuous"', html)
+        self.assertIn("let cameraGeneration = 0;", html)
+        self.assertNotIn('id="scanCameraSelect"', html)
+        self.assertIn("void openCamera();", html)
+        self.assertIn("void submitCode(value);", html)
+        self.assertIn("async function submitCode(content)", html)
+        self.assertIn('requestJSON("/api/accounts/scan-all"', html)
+        self.assertIn("body:JSON.stringify({qr_content:content})", html)
+        self.assertNotIn('requestJSON("/api/state"', html)
+        self.assertNotIn('requestJSON("/api/config"', html)
+        self.assertNotIn("new WebSocket", html)
+        self.assertTrue((static_dir / "vendor" / "jsQR.js").is_file())
+        self.assertTrue((static_dir / "vendor" / "jsQR.LICENSE").is_file())
+
 
 class ConfigApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         names = ("cfg", "hub", "client", "solver", "watcher", "llm_session",
-                 "config_revision")
+                 "account_manager", "config_revision")
         self.originals = {name: getattr(server, name) for name in names}
         server.cfg = config()
         server.cfg["llm"]["api_key"] = "old-secret"
+        server.cfg["email"].update({
+            "smtp_host": "smtp.old.example",
+            "smtp_port": 465,
+            "security": "ssl",
+            "username": "notify@old.example",
+            "password": "old-smtp-secret",
+            "from_address": "notify@old.example",
+            "to_address": "owner@example.com",
+        })
         server.hub = FakeHub()
+        server.account_manager = None
         server.client = FakeClient()
         server.llm_session = mock.MagicMock()
         server.solver = core.LLMSolver(server.cfg, server.llm_session)
@@ -2204,6 +2753,9 @@ class ConfigApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["llm"]["vision_enabled"])
         self.assertFalse(server.public_state()["llm"]["vision_enabled"])
         self.assertNotIn("old-secret", response.text)
+        self.assertTrue(payload["email"]["password_configured"])
+        self.assertNotIn("password", payload["email"])
+        self.assertNotIn("old-smtp-secret", response.text)
         self.assertEqual(response.headers["Cache-Control"], "no-store")
 
     async def test_auto_answer_maps_to_inverse_dry_run(self):
@@ -2379,6 +2931,80 @@ class ConfigApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(server.solver, old_solver)
         self.assertIs(server.watcher.solver, old_solver)
 
+    async def test_email_config_preserves_blank_password_and_never_returns_it(self):
+        request = FakeRequest({"email": {
+            "enabled": True,
+            "smtp_host": "smtp.old.example",
+            "smtp_port": 465,
+            "security": "ssl",
+            "username": "notify@old.example",
+            "from_address": "notify@old.example",
+            "to_address": "new-owner@example.com",
+            "cooldown_seconds": 1200,
+        }})
+
+        with mock.patch.object(server, "save_config") as save:
+            response = await server.api_config(request)
+
+        persisted = save.call_args.args[0]["email"]
+        payload = json.loads(response.text)["email"]
+        self.assertEqual(persisted["password"], "old-smtp-secret")
+        self.assertEqual(persisted["to_address"], "new-owner@example.com")
+        self.assertTrue(payload["enabled"])
+        self.assertTrue(payload["password_configured"])
+        self.assertNotIn("password", payload)
+        self.assertNotIn("old-smtp-secret", response.text)
+
+    async def test_email_connection_change_requires_new_password(self):
+        before = json.loads(json.dumps(server.cfg))
+        request = FakeRequest({"email": {
+            "enabled": True,
+            "smtp_host": "smtp.new.example",
+            "smtp_port": 587,
+            "security": "starttls",
+            "username": "notify@new.example",
+            "from_address": "notify@new.example",
+            "to_address": "owner@example.com",
+            "cooldown_seconds": 900,
+        }})
+
+        with mock.patch.object(server, "save_config") as save:
+            with self.assertRaisesRegex(ValueError, "必须填写新的 SMTP 密码"):
+                await server.api_config(request)
+
+        self.assertEqual(server.cfg, before)
+        save.assert_not_called()
+
+    async def test_email_config_rejects_unsafe_values(self):
+        invalid_updates = (
+            {"smtp_host": "smtp.example.com\r\nX-Test: injected"},
+            {"smtp_port": True},
+            {"smtp_port": 70000},
+            {"security": "plain"},
+            {"to_address": "not-an-email"},
+            {"unknown": "value"},
+        )
+        for update in invalid_updates:
+            with self.subTest(update=update):
+                before = json.loads(json.dumps(server.cfg))
+                with mock.patch.object(server, "save_config") as save:
+                    with self.assertRaises(ValueError):
+                        await server.api_config(FakeRequest({"email": update}))
+                self.assertEqual(server.cfg, before)
+                save.assert_not_called()
+
+    async def test_email_test_uses_saved_config_and_never_accepts_inline_secrets(self):
+        with mock.patch.object(
+            server.emailer.EmailNotifier, "send_test", new=mock.AsyncMock(return_value=True),
+        ) as send_test:
+            response = await server.api_email_test(FakeRequest({}))
+            with self.assertRaisesRegex(ValueError, "不接受配置字段"):
+                await server.api_email_test(FakeRequest({"password": "new-secret"}))
+
+        self.assertEqual(response.status, 200)
+        send_test.assert_awaited_once_with()
+        self.assertNotIn("old-smtp-secret", response.text)
+
     async def test_config_write_requires_same_origin_json(self):
         wrong_type = await server.api_config(FakeRequest(
             {}, content_type="text/plain",
@@ -2464,6 +3090,33 @@ class MultiAccountManagerTests(unittest.IsolatedAsyncioTestCase):
         client.user_name = "User " + str(user_id)
         return client
 
+    def prepare_answer(self, runtime, lesson_id, problem_id, title="Question"):
+        watcher = runtime.watcher
+        watcher.running = True
+        watcher.lesson_id = str(lesson_id)
+        watcher.problems[problem_id] = {
+            "problem_id": problem_id,
+            "type": 1,
+            "title": title,
+            "options": [("A", "One"), ("B", "Two")],
+            "images": [],
+        }
+        now = time.time()
+        watcher.question_windows[problem_id] = {
+            "start": now,
+            "dt_ms": int(now * 1000),
+            "limit": 30,
+            "safety": 5,
+            "closes_at": now + 30,
+            "submit_by": now + 25,
+            "lesson_id": str(lesson_id),
+        }
+        if not isinstance(runtime.client.submit_answer, mock.AsyncMock):
+            runtime.client.submit_answer = mock.AsyncMock(return_value={"code": 0})
+        task = asyncio.create_task(watcher._answer_flow(problem_id))
+        watcher.answer_tasks[problem_id] = task
+        return task
+
     async def test_two_accounts_use_isolated_sessions_and_duplicate_does_not_replace(self):
         first, created_first = await self.manager.add_verified(
             await self.source_client("1", "cookie-one")
@@ -2547,6 +3200,195 @@ class MultiAccountManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(first.watcher.solver, replacement)
         self.assertIs(second.watcher.solver, replacement)
+
+    async def test_scan_all_checks_in_every_logged_in_account(self):
+        first, _ = await self.manager.add_verified(await self.source_client("1", "one"))
+        second, _ = await self.manager.add_verified(await self.source_client("2", "two"))
+        for runtime in (first, second):
+            runtime.client.get_on_lesson = mock.AsyncMock(return_value=[{
+                "lessonId": "lesson-scan",
+            }])
+            runtime.client.scan_qr = mock.AsyncMock(return_value="lesson-scan")
+            runtime.client.checkin = mock.AsyncMock(return_value={
+                "ok": True,
+                "bearer": f"bearer-{runtime.account_id}",
+                "lesson_token": f"lesson-{runtime.account_id}",
+            })
+
+        qr_url = "https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?code=x"
+        result = await self.manager.scan_all(qr_url)
+
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["success"], 2)
+        self.assertTrue(all(item["ok"] for item in result["results"]))
+        for runtime in (first, second):
+            runtime.client.scan_qr.assert_awaited_once_with(
+                qr_url
+            )
+            runtime.client.checkin.assert_awaited_once_with(
+                "lesson-scan", join_if_not_in=False,
+            )
+            self.assertEqual(runtime.client.bearer, f"bearer-{runtime.account_id}")
+
+    async def test_scan_all_skips_accounts_not_enrolled_in_lesson(self):
+        runtime, _ = await self.manager.add_verified(await self.source_client("1", "one"))
+        runtime.client.get_on_lesson = mock.AsyncMock(return_value=[{
+            "lessonId": "different-lesson",
+        }])
+        runtime.client.scan_qr = mock.AsyncMock(return_value="lesson-scan")
+        runtime.client.checkin = mock.AsyncMock()
+
+        result = await self.manager.scan_all(
+            "https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?c=x&t=1&s=y&v=2"
+        )
+
+        self.assertEqual(result["success"], 0)
+        self.assertEqual(result["results"][0]["status"], "not_enrolled")
+        self.assertIn("未加入", result["results"][0]["message"])
+        runtime.client.checkin.assert_not_awaited()
+
+    async def test_scan_all_does_not_replace_other_active_lesson_credentials(self):
+        runtime, _ = await self.manager.add_verified(await self.source_client("1", "one"))
+        runtime.watcher.running = True
+        runtime.watcher.lesson_id = "lesson-a"
+        runtime.client.bearer = "bearer-a"
+        runtime.client.lesson_token = "token-a"
+        runtime.client.get_on_lesson = mock.AsyncMock(return_value=[
+            {"lessonId": "lesson-a"}, {"lessonId": "lesson-b"},
+        ])
+        runtime.client.scan_qr = mock.AsyncMock(return_value="lesson-b")
+        runtime.client.checkin = mock.AsyncMock(return_value={
+            "ok": True, "bearer": "bearer-b", "lesson_token": "token-b",
+        })
+
+        result = await self.manager.scan_all(
+            "https://www.yuketang.cn/api/v3/lesson/check-in/dynamic-qr-code?c=x&t=1&s=y&v=2"
+        )
+
+        self.assertEqual(result["success"], 1)
+        self.assertFalse(result["results"][0]["credentials_applied"])
+        self.assertEqual(runtime.client.bearer, "bearer-a")
+        self.assertEqual(runtime.client.lesson_token, "token-a")
+
+    async def test_same_lesson_problem_is_solved_once_and_submitted_to_both_accounts(self):
+        self.cfg["bot"]["dry_run"] = False
+        shared_solver = GatedSolver(answer_for=lambda problem: ["B"])
+        self.manager.set_solver(shared_solver)
+        first, _ = await self.manager.add_verified(await self.source_client("1", "one"))
+        second, _ = await self.manager.add_verified(await self.source_client("2", "two"))
+
+        first_task = self.prepare_answer(first, "lesson-1", "shared-problem")
+        second_task = self.prepare_answer(second, "lesson-1", "shared-problem")
+        await asyncio.wait_for(shared_solver.started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        self.assertEqual(len(shared_solver.calls), 1)
+
+        shared_solver.release.set()
+        await asyncio.gather(first_task, second_task)
+
+        self.assertEqual(len(shared_solver.calls), 1)
+        first.client.submit_answer.assert_awaited_once()
+        second.client.submit_answer.assert_awaited_once()
+        first_result = first.client.submit_answer.await_args.args[3]
+        second_result = second.client.submit_answer.await_args.args[3]
+        self.assertEqual(first_result, ["B"])
+        self.assertEqual(second_result, first_result)
+
+    async def test_late_account_reuses_completed_answer_for_same_lesson_problem(self):
+        self.cfg["bot"]["dry_run"] = False
+        solver = mock.MagicMock()
+        solver.solve = mock.AsyncMock(return_value={
+            "result": ["B"], "display": '["B"]',
+        })
+        self.manager.set_solver(solver)
+        first, _ = await self.manager.add_verified(await self.source_client("1", "one"))
+        second, _ = await self.manager.add_verified(await self.source_client("2", "two"))
+
+        first_task = self.prepare_answer(first, "lesson-1", "shared-problem")
+        await first_task
+        self.assertEqual(solver.solve.await_count, 1)
+
+        second_task = self.prepare_answer(second, "lesson-1", "shared-problem")
+        await second_task
+
+        self.assertEqual(solver.solve.await_count, 1)
+        first_result = first.client.submit_answer.await_args.args[3]
+        second_result = second.client.submit_answer.await_args.args[3]
+        self.assertEqual(first_result, ["B"])
+        self.assertEqual(second_result, first_result)
+
+    async def test_same_problem_id_in_different_lessons_is_not_shared(self):
+        self.cfg["bot"]["dry_run"] = False
+        shared_solver = GatedSolver(
+            expected_starts=2,
+            answer_for=lambda problem: ["A"] if problem["title"] == "First" else ["B"],
+        )
+        self.manager.set_solver(shared_solver)
+        first, _ = await self.manager.add_verified(await self.source_client("1", "one"))
+        second, _ = await self.manager.add_verified(await self.source_client("2", "two"))
+
+        first_task = self.prepare_answer(first, "lesson-1", "same-id", "First")
+        second_task = self.prepare_answer(second, "lesson-2", "same-id", "Second")
+        both_started = True
+        try:
+            await asyncio.wait_for(shared_solver.all_started.wait(), timeout=1)
+        except asyncio.TimeoutError:
+            both_started = False
+        finally:
+            shared_solver.release.set()
+            await asyncio.gather(first_task, second_task, return_exceptions=True)
+
+        self.assertTrue(both_started, "different lessons must start independent solves")
+        self.assertEqual(len(shared_solver.calls), 2)
+        self.assertEqual(first.client.submit_answer.await_args.args[3], ["A"])
+        self.assertEqual(second.client.submit_answer.await_args.args[3], ["B"])
+
+    async def test_next_problem_in_same_lesson_is_solved_separately(self):
+        self.cfg["bot"]["dry_run"] = False
+        solver = mock.MagicMock()
+        solver.solve = mock.AsyncMock(side_effect=[
+            {"result": ["A"], "display": '["A"]'},
+            {"result": ["B"], "display": '["B"]'},
+        ])
+        self.manager.set_solver(solver)
+        runtime, _ = await self.manager.add_verified(await self.source_client("1", "one"))
+
+        first_task = self.prepare_answer(runtime, "lesson-1", "problem-1", "First")
+        await first_task
+        second_task = self.prepare_answer(runtime, "lesson-1", "problem-2", "Second")
+        await second_task
+
+        self.assertEqual(solver.solve.await_count, 2)
+        submitted = [call.args[3] for call in runtime.client.submit_answer.await_args_list]
+        self.assertEqual(submitted, [["A"], ["B"]])
+
+    async def test_cancelling_one_waiter_does_not_cancel_shared_solve(self):
+        self.cfg["bot"]["dry_run"] = False
+        shared_solver = GatedSolver(answer_for=lambda problem: ["B"])
+        self.manager.set_solver(shared_solver)
+        first, _ = await self.manager.add_verified(await self.source_client("1", "one"))
+        second, _ = await self.manager.add_verified(await self.source_client("2", "two"))
+
+        first_task = self.prepare_answer(first, "lesson-1", "shared-problem")
+        await asyncio.wait_for(shared_solver.started.wait(), timeout=1)
+        second_task = self.prepare_answer(second, "lesson-1", "shared-problem")
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        second_task.cancel()
+        await asyncio.gather(second_task, return_exceptions=True)
+        await asyncio.sleep(0)
+        solver_was_cancelled = shared_solver.cancelled
+        shared_solver.release.set()
+        first_result = await asyncio.gather(first_task, return_exceptions=True)
+
+        self.assertTrue(second_task.cancelled())
+        self.assertFalse(solver_was_cancelled)
+        self.assertEqual(first_result, [None])
+        self.assertEqual(len(shared_solver.calls), 1)
+        self.assertFalse(shared_solver.cancelled)
+        first.client.submit_answer.assert_awaited_once()
+        second.client.submit_answer.assert_not_awaited()
 
     async def test_public_state_contains_sanitized_account_list(self):
         first, _ = await self.manager.add_verified(await self.source_client("1", "one"))

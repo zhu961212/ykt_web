@@ -10,6 +10,9 @@
   body { font:14px/1.6 "Segoe UI",system-ui,sans-serif; background:var(--bg); color:#1c1e21; }
   header { display:flex; align-items:center; gap:12px; padding:12px 20px; background:var(--card); border-bottom:1px solid var(--bd); position:sticky; top:0; z-index:5; }
   header h1 { font-size:16px; font-weight:600; white-space:nowrap; }
+  .view-tabs { display:flex; align-items:center; align-self:stretch; gap:4px; margin-left:4px; }
+  button.view-tab { min-height:32px; padding:4px 10px; border:0; border-bottom:2px solid transparent; border-radius:0; background:transparent; color:var(--mut); }
+  button.view-tab[aria-selected="true"] { border-bottom-color:var(--blue); color:var(--blue); font-weight:600; }
   .badge { padding:2px 8px; border-radius:8px; font-size:12px; border:1px solid var(--bd); background:#f1f2f5; color:var(--mut); white-space:nowrap; }
   .badge.ok { background:#eaf3de; color:var(--green); border-color:#c0dd97; }
   .badge.live { background:#e6f1fb; color:var(--blue); border-color:#b5d4f4; }
@@ -54,29 +57,67 @@
   #log .warn { color:#e3b341; } #log .error { color:#f85149; } #log .debug { color:#8b949e; }
   .stats { display:flex; gap:18px; font-size:13px; color:var(--mut); white-space:nowrap; }
   .stats b { color:#1c1e21; font-weight:500; }
+  .settings-only { display:none; }
+  #appShell.settings-mode .console-only { display:none !important; }
+  #appShell.settings-mode .settings-only { display:block; }
+  #appShell.settings-mode main { grid-template-columns:minmax(0,1fr) minmax(0,1fr); max-width:960px; }
+  #appShell.settings-mode main > .col:first-child { display:contents; }
+  #appShell.settings-mode .settings-heading { grid-column:1 / -1; }
+  #appShell.settings-mode .admin-settings { grid-column:1 / -1; }
+  #appShell.settings-mode .scanner-settings { grid-column:1 / -1; }
+  .settings-heading h2 { font-size:18px; font-weight:600; }
+  .admin-form-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:0 12px; }
+  [hidden] { display:none !important; }
+  .auth-gate { min-height:100vh; min-height:100dvh; display:grid; place-items:center; padding:20px; }
+  .auth-panel { width:min(360px,100%); padding:20px; background:var(--card); border:1px solid var(--bd); border-radius:8px; }
+  .auth-panel h1 { font-size:18px; font-weight:600; margin-bottom:12px; }
+  .auth-panel button { width:100%; margin-top:14px; }
+  .auth-status { min-height:22px; color:var(--mut); font-size:13px; }
+  .auth-error { min-height:22px; margin-top:8px; color:var(--red); font-size:12px; overflow-wrap:anywhere; }
   @media (max-width:900px) {
     header { flex-wrap:wrap; padding:10px 14px; }
     header .spacer { display:none; }
     header .stats { order:3; width:100%; }
     main { grid-template-columns:1fr; padding:12px; }
+    #appShell.settings-mode main { grid-template-columns:1fr; }
+    .admin-form-grid { grid-template-columns:1fr; }
     #log { height:320px; }
   }
 </style>
 </head>
 <body>
+<section id="authGate" class="auth-gate">
+  <div class="auth-panel">
+    <h1>雨课堂答题面板</h1>
+    <div id="authChecking" class="auth-status">正在检查访问权限</div>
+    <form id="authForm" autocomplete="on" hidden>
+      <label class="field"><span>管理账号</span><input id="authUsername" type="text" maxlength="128" autocomplete="username" required></label>
+      <label class="field"><span>密码</span><input id="authPassword" type="password" maxlength="256" autocomplete="current-password" required></label>
+      <button id="btnAuthLogin" class="primary" type="submit">登录</button>
+      <div id="authError" class="auth-error" role="alert"></div>
+    </form>
+  </div>
+</section>
+
+<div id="appShell" hidden>
 <header>
   <h1>雨课堂答题面板</h1>
   <span id="loginBadge" class="badge">0 个账号</span>
   <span id="phaseBadge" class="badge">未启动</span>
+  <nav class="view-tabs" aria-label="页面">
+    <button class="view-tab" type="button" data-view="console" aria-selected="true">控制台</button>
+    <button class="view-tab" type="button" data-view="settings" aria-selected="false">设置</button>
+  </nav>
   <div class="spacer"></div>
   <div class="stats">已缓存 <b id="stProblems">0</b> 题 · 已答 <b id="stAnswered">0</b> 题</div>
   <button id="btnWatch" class="primary" disabled>全部开始</button>
   <button id="btnStop" class="danger" style="display:none">全部停止</button>
+  <button id="btnAdminLogout" type="button" hidden>退出管理</button>
 </header>
 
-<main>
+<main id="workspace">
   <div class="col">
-    <section class="card">
+    <section class="card console-only">
       <h2 class="form-heading"><span>账号</span><span id="accountCount" class="badge">0</span></h2>
       <div id="accountList" class="account-list"></div>
       <div id="emptyAccounts" class="empty">尚未添加账号</div>
@@ -84,19 +125,50 @@
       <div class="hint" id="qrHint">未登录</div>
       <div class="row" style="margin-top:10px">
         <button id="btnQr" class="primary" style="flex:1">添加账号</button>
+        <button id="btnScanAll" style="flex:1" disabled>扫码签到</button>
         <button id="btnLogout" style="display:none">全部退出</button>
       </div>
     </section>
 
-    <section class="card">
+    <section class="card console-only">
       <h2>监课控制</h2>
       <label class="switch"><input type="checkbox" id="autoAnswer"> 自动答题并提交</label>
       <label class="switch"><input type="checkbox" id="autoStart"> 登录后自动开始监课</label>
       <div style="border-top:1px solid var(--bd);margin:6px 0"></div>
-      <div class="kv"><span>签到方式</span><b>雨课堂 App 手动签到</b></div>
+      <div class="kv"><span>签到方式</span><b>App 手动 / 面板扫码</b></div>
     </section>
 
-    <section class="card">
+    <div class="settings-heading settings-only"><h2>设置</h2></div>
+
+    <section class="card settings-only admin-settings">
+      <h2>管理员密码</h2>
+      <form id="adminForm" autocomplete="off">
+        <div class="admin-form-grid">
+          <label class="field"><span>新密码</span><input id="adminNewPassword" type="password" minlength="12" maxlength="256" pattern="[A-Za-z0-9._~\-]{12,256}" autocomplete="new-password" required></label>
+          <label class="field"><span>确认新密码</span><input id="adminConfirmPassword" type="password" minlength="12" maxlength="256" pattern="[A-Za-z0-9._~\-]{12,256}" autocomplete="new-password" required></label>
+        </div>
+        <button id="btnSaveAdmin" class="primary" type="submit" style="width:100%;margin-top:10px">更新管理员密码</button>
+        <div id="adminHint" class="hint form-message"></div>
+      </form>
+    </section>
+
+    <section class="card settings-only scanner-settings">
+      <h2 class="form-heading"><span>扫码页面</span><span id="scannerBadge" class="badge">未配置</span></h2>
+      <form id="scannerForm" autocomplete="off">
+        <label class="field"><span>页面地址</span><input id="scannerUrl" type="text" readonly></label>
+        <div class="admin-form-grid">
+          <label class="field"><span>扫码页密码</span><input id="scannerPassword" type="password" minlength="8" maxlength="128" pattern="[A-Za-z0-9._~\-]{8,128}" autocomplete="new-password" required></label>
+          <label class="field"><span>确认扫码页密码</span><input id="scannerPasswordConfirm" type="password" minlength="8" maxlength="128" pattern="[A-Za-z0-9._~\-]{8,128}" autocomplete="new-password" required></label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button id="btnSaveScanner" class="primary" type="submit" style="flex:1">保存扫码页密码</button>
+          <button id="btnOpenScanner" type="button">打开扫码页</button>
+        </div>
+        <div id="scannerHint" class="hint form-message"></div>
+      </form>
+    </section>
+
+    <section class="card settings-only">
       <h2 class="form-heading"><span>模型配置</span><span id="llmKeyBadge" class="badge">未配置</span></h2>
       <form id="llmForm" autocomplete="off">
         <label class="field"><span>API 地址</span><input id="llmBaseUrl" type="url" maxlength="2048" spellcheck="false" required></label>
@@ -108,15 +180,36 @@
       </form>
     </section>
 
+    <section class="card settings-only">
+      <h2 class="form-heading"><span>邮件通知</span><span id="emailPasswordBadge" class="badge">未配置</span></h2>
+      <form id="emailForm" autocomplete="off">
+        <label class="switch"><input type="checkbox" id="emailEnabled"> 启用邮件通知</label>
+        <label class="field"><span>SMTP 地址</span><input id="emailSmtpHost" type="text" maxlength="253" spellcheck="false" required></label>
+        <label class="field"><span>端口</span><input id="emailSmtpPort" type="number" min="1" max="65535" step="1" required></label>
+        <label class="field"><span>加密方式</span><select id="emailSecurity" required><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></label>
+        <label class="field"><span>用户名</span><input id="emailUsername" type="text" maxlength="320" autocomplete="off" spellcheck="false" required></label>
+        <label class="field"><span>密码</span><input id="emailPassword" type="password" maxlength="8192" autocomplete="new-password"></label>
+        <label class="field"><span>发件地址</span><input id="emailFromAddress" type="email" maxlength="320" autocomplete="off" spellcheck="false" required></label>
+        <label class="field"><span>收件地址</span><input id="emailToAddress" type="email" maxlength="320" autocomplete="off" spellcheck="false" required></label>
+        <label class="field"><span>相同问题提醒间隔（分钟）</span><input id="emailCooldownMinutes" type="number" min="1" max="1440" step="1" value="15" required></label>
+        <div class="row" style="margin-top:10px">
+          <button id="btnSaveEmail" class="primary" type="submit" style="flex:1">保存邮件配置</button>
+          <button id="btnTestEmail" type="button" disabled>发送测试邮件</button>
+        </div>
+        <div id="emailHint" class="hint form-message"></div>
+      </form>
+    </section>
+
   </div>
 
-  <div class="col">
+  <div class="col console-only">
     <section class="card" style="flex:1;display:flex;flex-direction:column">
       <h2>实时日志</h2>
       <div id="log"></div>
     </section>
   </div>
 </main>
+</div>
 
 <script>
 "use strict";
@@ -129,6 +222,12 @@ let accountStates = new Map();
 let llmFormInitialized = false;
 let llmFormDirty = false;
 let llmModels = [];
+let emailFormDirty = false;
+let emailConfigSaved = false;
+let emailPasswordConfigured = false;
+let panelBootstrapped = false;
+let stateRefreshTimer = null;
+let adminAuthRequired = false;
 
 function addLog(text, level, accountName) {
   const log = $("log");
@@ -184,12 +283,101 @@ function applyLlmState(settings) {
   }
 }
 
+function updateEmailTestButton() {
+  $("btnTestEmail").disabled = !emailConfigSaved || !emailPasswordConfigured;
+}
+
+function applyEmailState(settings) {
+  if (!settings) return;
+  emailPasswordConfigured = !!settings.password_configured;
+  setBadge($("emailPasswordBadge"), emailPasswordConfigured ? "已配置" : "未配置",
+           emailPasswordConfigured ? "ok" : "warn");
+  const passwordInput = $("emailPassword");
+  passwordInput.placeholder = emailPasswordConfigured ? "已配置，留空保持不变" : "请输入 SMTP 密码";
+  if (!emailFormDirty) {
+    $("emailEnabled").checked = !!settings.enabled;
+    $("emailSmtpHost").value = settings.smtp_host || "";
+    $("emailSmtpPort").value = settings.smtp_port || 465;
+    $("emailSecurity").value = settings.security === "starttls" ? "starttls" : "ssl";
+    $("emailUsername").value = settings.username || "";
+    $("emailFromAddress").value = settings.from_address || "";
+    $("emailToAddress").value = settings.to_address || "";
+    const cooldownSeconds = Number(settings.cooldown_seconds);
+    const cooldownMinutes = Number.isFinite(cooldownSeconds)
+      ? Math.max(1, Math.min(1440, Math.round(cooldownSeconds / 60)))
+      : 15;
+    $("emailCooldownMinutes").value = cooldownMinutes;
+    passwordInput.value = "";
+    emailConfigSaved = true;
+  }
+  updateEmailTestButton();
+}
+
+function applyAdminState(settings) {
+  if (settings && settings.reset_mode) {
+    $("adminHint").textContent = "管理员恢复模式已开启，改密后请将 YKT_ADMIN_RESET 改回 0";
+  }
+}
+
+function applyScannerState(settings) {
+  if (!settings) return;
+  setBadge($("scannerBadge"), settings.configured ? "已配置" : "未配置",
+           settings.configured ? "ok" : "warn");
+  $("scannerUrl").value = location.origin + (settings.path || "/scan");
+}
+
 async function requestJSON(url, options) {
   const response = await fetch(url, options);
   let data = {};
   try { data = await response.json(); } catch (error) {}
+  if (response.status === 401 && panelBootstrapped) {
+    window.location.reload();
+    throw new Error("管理员登录已失效");
+  }
   if (!response.ok) throw new Error(data.message || ("请求失败 HTTP " + response.status));
   return data;
+}
+
+function showAuthForm(message) {
+  $("authChecking").hidden = true;
+  $("authForm").hidden = false;
+  $("authError").textContent = message || "";
+  window.requestAnimationFrame(() => $("authUsername").focus());
+}
+
+function setPanelView(view) {
+  const selected = view === "settings" ? "settings" : "console";
+  $("appShell").classList.toggle("settings-mode", selected === "settings");
+  for (const button of document.querySelectorAll("button[data-view]")) {
+    button.setAttribute("aria-selected", String(button.dataset.view === selected));
+  }
+}
+
+function bootstrapPanel() {
+  if (panelBootstrapped) return;
+  panelBootstrapped = true;
+  setPanelView(location.hash === "#settings" ? "settings" : "console");
+  $("authGate").hidden = true;
+  $("appShell").hidden = false;
+  $("btnAdminLogout").hidden = !adminAuthRequired;
+  connectWs();
+  void refreshState();
+  void refreshEmailConfig();
+  if (stateRefreshTimer === null) stateRefreshTimer = window.setInterval(refreshState, 5000);
+}
+
+async function checkAuthorization() {
+  try {
+    const status = await requestJSON("/api/auth/status");
+    adminAuthRequired = status.required === true;
+    if (status.required === false || status.authenticated === true) {
+      bootstrapPanel();
+      return;
+    }
+    showAuthForm("");
+  } catch (error) {
+    showAuthForm("无法检查访问权限，请登录后重试");
+  }
 }
 
 function applyState(state) {
@@ -216,6 +404,7 @@ function applyState(state) {
   $("btnWatch").style.display = active.some(account => !account.watching) ? "" : "none";
   $("btnStop").style.display = watching.length ? "" : "none";
   $("btnWatch").disabled = !active.length;
+  $("btnScanAll").disabled = !active.length;
   $("btnLogout").style.display = accounts.length ? "" : "none";
   if (!qrController) $("qrHint").textContent = active.length ? "可继续添加账号" : "尚未登录";
 }
@@ -315,6 +504,17 @@ async function refreshState() {
   try { applyState(await requestJSON("/api/state")); } catch (error) {}
 }
 
+async function refreshEmailConfig() {
+  try {
+    const result = await requestJSON("/api/config");
+    applyEmailState(result.email);
+    applyAdminState(result.admin);
+    applyScannerState(result.scanner);
+  } catch (error) {
+    $("emailHint").textContent = "邮件配置读取失败: " + error.message;
+  }
+}
+
 function stopQrPoll() {
   if (qrController) qrController.abort();
   qrController = null;
@@ -400,6 +600,17 @@ async function watchStart() {
 }
 
 $("btnQr").onclick = qrStart;
+$("btnScanAll").onclick = () => { window.location.href = "/scan"; };
+for (const button of document.querySelectorAll("button[data-view]")) {
+  button.onclick = () => {
+    const view = button.dataset.view === "settings" ? "settings" : "console";
+    if (location.hash !== "#" + view) location.hash = view;
+    setPanelView(view);
+  };
+}
+window.addEventListener("hashchange", () => {
+  if (panelBootstrapped) setPanelView(location.hash === "#settings" ? "settings" : "console");
+});
 $("btnWatch").onclick = watchStart;
 $("btnStop").onclick = async () => {
   try { await requestJSON("/api/watch/stop", {method:"POST"}); await refreshState(); }
@@ -537,6 +748,180 @@ $("llmForm").onsubmit = async event => {
     button.disabled = false;
   }
 };
+$("adminForm").onsubmit = async event => {
+  event.preventDefault();
+  const button = $("btnSaveAdmin");
+  const hint = $("adminHint");
+  const newPassword = $("adminNewPassword").value;
+  const confirmPassword = $("adminConfirmPassword").value;
+  if (newPassword !== confirmPassword) {
+    hint.textContent = "两次输入的新密码不一致";
+    return;
+  }
+  button.disabled = true;
+  hint.textContent = "正在更新";
+  try {
+    const result = await requestJSON("/api/admin/credentials", {
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({new_password: newPassword})
+    });
+    $("adminNewPassword").value = "";
+    $("adminConfirmPassword").value = "";
+    hint.textContent = result.admin && result.admin.reset_mode
+      ? "密码已更新，请将 YKT_ADMIN_RESET 改回 0 并重启服务"
+      : "管理员密码已更新";
+  } catch (error) {
+    hint.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+};
+$("scannerForm").onsubmit = async event => {
+  event.preventDefault();
+  const button = $("btnSaveScanner");
+  const hint = $("scannerHint");
+  const password = $("scannerPassword").value;
+  if (password !== $("scannerPasswordConfirm").value) {
+    hint.textContent = "两次输入的扫码页密码不一致";
+    return;
+  }
+  button.disabled = true;
+  hint.textContent = "正在保存";
+  try {
+    const result = await requestJSON("/api/scanner/credentials", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body:JSON.stringify({new_password:password})
+    });
+    applyScannerState(result.scanner);
+    $("scannerPassword").value = "";
+    $("scannerPasswordConfirm").value = "";
+    hint.textContent = "扫码页密码已更新";
+  } catch (error) {
+    hint.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+};
+$("btnOpenScanner").onclick = () => window.open("/scan", "_blank", "noopener");
+function markEmailFormDirty() {
+  emailFormDirty = true;
+  emailConfigSaved = false;
+  $("emailHint").textContent = "";
+  updateEmailTestButton();
+}
+for (const id of [
+  "emailEnabled", "emailSmtpHost", "emailSmtpPort", "emailSecurity", "emailUsername",
+  "emailPassword", "emailFromAddress", "emailToAddress", "emailCooldownMinutes"
+]) {
+  $(id).addEventListener("input", markEmailFormDirty);
+  $(id).addEventListener("change", markEmailFormDirty);
+}
+$("emailForm").onsubmit = async event => {
+  event.preventDefault();
+  const button = $("btnSaveEmail");
+  const testButton = $("btnTestEmail");
+  const hint = $("emailHint");
+  const cooldownMinutes = Number($("emailCooldownMinutes").value);
+  const email = {
+    enabled: $("emailEnabled").checked,
+    smtp_host: $("emailSmtpHost").value.trim(),
+    smtp_port: Number($("emailSmtpPort").value),
+    security: $("emailSecurity").value,
+    username: $("emailUsername").value.trim(),
+    from_address: $("emailFromAddress").value.trim(),
+    to_address: $("emailToAddress").value.trim(),
+    cooldown_seconds: Math.round(cooldownMinutes * 60)
+  };
+  const password = $("emailPassword").value;
+  if (password) email.password = password;
+  button.disabled = true;
+  testButton.disabled = true;
+  hint.textContent = "正在保存";
+  try {
+    const result = await requestJSON("/api/config", {
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({email})
+    });
+    emailFormDirty = false;
+    applyEmailState(result.email);
+    hint.textContent = "已保存";
+    addLog("邮件配置已保存");
+  } catch (error) {
+    hint.textContent = error.message;
+    addLog("邮件配置保存失败", "error");
+  } finally {
+    button.disabled = false;
+    updateEmailTestButton();
+  }
+};
+$("btnTestEmail").onclick = async () => {
+  if (!emailConfigSaved || !emailPasswordConfigured) return;
+  const button = $("btnTestEmail");
+  const saveButton = $("btnSaveEmail");
+  const hint = $("emailHint");
+  button.disabled = true;
+  saveButton.disabled = true;
+  hint.textContent = "正在发送测试邮件";
+  try {
+    await requestJSON("/api/config/email/test", {
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:"{}"
+    });
+    hint.textContent = "测试邮件已发送";
+    addLog("测试邮件已发送");
+  } catch (error) {
+    hint.textContent = error.message;
+    addLog("测试邮件发送失败", "error");
+  } finally {
+    saveButton.disabled = false;
+    updateEmailTestButton();
+  }
+};
+$("authForm").onsubmit = async event => {
+  event.preventDefault();
+  const usernameInput = $("authUsername");
+  const passwordInput = $("authPassword");
+  const button = $("btnAuthLogin");
+  const errorMessage = $("authError");
+  const username = usernameInput.value.trim();
+  const password = passwordInput.value;
+  usernameInput.disabled = true;
+  passwordInput.disabled = true;
+  button.disabled = true;
+  errorMessage.textContent = "";
+  try {
+    const result = await requestJSON("/api/auth/login", {
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({username, password})
+    });
+    if (result.authenticated === false) throw new Error(result.message || "账号或密码错误");
+    passwordInput.value = "";
+    bootstrapPanel();
+  } catch (error) {
+    passwordInput.value = "";
+    errorMessage.textContent = error.message;
+  } finally {
+    if (!panelBootstrapped) {
+      usernameInput.disabled = false;
+      passwordInput.disabled = false;
+      button.disabled = false;
+      passwordInput.focus();
+    }
+  }
+};
+$("btnAdminLogout").onclick = async () => {
+  try {
+    await requestJSON("/api/auth/logout", {
+      method:"POST", headers:{"content-type":"application/json"}, body:"{}"
+    });
+  } finally {
+    window.location.reload();
+  }
+};
 $("btnLogout").onclick = async () => {
   if (!window.confirm("退出全部账号并删除所有本地登录会话？")) return;
   try {
@@ -546,9 +931,7 @@ $("btnLogout").onclick = async () => {
   } catch (error) { addLog("退出失败: " + error.message, "error"); }
 };
 
-connectWs();
-refreshState();
-setInterval(refreshState, 5000);
+void checkAuthorization();
 </script>
 </body>
 </html>

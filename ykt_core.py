@@ -24,6 +24,17 @@ SERVERS = {
     "huanghe": "https://huanghe.yuketang.cn",
 }
 
+
+class AuthenticationExpired(RuntimeError):
+    """The upstream explicitly rejected account or classroom credentials."""
+
+
+class QRCodeScanError(RuntimeError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
 BASE_HEADERS = {
     "user-agent": "Android",
     "brand": "google Pixel 9 Pro",
@@ -73,6 +84,26 @@ def _plain_text(value) -> str:
     value = html.unescape(str(value))
     value = re.sub(r"<[^>]+>", " ", value)
     return re.sub(r"\s+", " ", value).strip()
+
+
+def validate_checkin_qr_url(value: str) -> str:
+    value = str(value or "").strip()
+    if not value or len(value) > 8192:
+        raise ValueError("二维码内容无效")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("二维码 URL 无效") from exc
+    host = (parsed.hostname or "").lower().rstrip(".")
+    expected_path = "/api/v3/lesson/check-in/dynamic-qr-code"
+    if (parsed.scheme != "https" or not host.endswith(".yuketang.cn")
+            or parsed.username or parsed.password or port is not None
+            or not (parsed.path == expected_path
+                    or parsed.path.startswith(expected_path + "/"))
+            or parsed.fragment):
+        raise ValueError("仅支持雨课堂动态签到二维码")
+    return value
 
 
 def _normalize_image_source(value) -> str:
@@ -1027,7 +1058,8 @@ class YuketangClient:
     async def _req(self, method: str, path: str, **kw):
         url = path if path.startswith("http") else self.base + path
         timeout = kw.pop("timeout", aiohttp.ClientTimeout(total=35))
-        async with self.http.request(method, url, headers=self._headers(),
+        with_bearer = kw.pop("with_bearer", True)
+        async with self.http.request(method, url, headers=self._headers(with_bearer),
                                      timeout=timeout, **kw) as r:
             try:
                 data = await r.json(content_type=None)
@@ -1190,6 +1222,11 @@ class YuketangClient:
 
         data = payload.get("data") if isinstance(payload, dict) else None
         values = data.get("onLessonClassrooms") if isinstance(data, dict) else None
+        if status in (401, 403):
+            self.lesson_discovery = {
+                "latest": {"ok": False, "http": status, "auth_expired": True}
+            }
+            raise AuthenticationExpired(f"雨课堂账号授权已失效: HTTP {status}")
         if (status >= 400 or not isinstance(payload, dict) or payload.get("code") != 0
                 or not isinstance(data, dict) or not isinstance(values, list)):
             code = payload.get("code") if isinstance(payload, dict) else None
@@ -1220,16 +1257,32 @@ class YuketangClient:
         return deduplicated
 
     async def scan_qr(self, url: str):
-        st, _, data = await self._req("POST", "/api/v3/app/scan", json={"url": url})
-        if not data or data.get("code") != 0:
-            raise RuntimeError(f"扫码解析失败: {data}")
-        return (data.get("data") or {}).get("value")
+        url = validate_checkin_qr_url(url)
+        st, _, data = await self._req(
+            "POST", "/api/v3/app/scan", json={"url": url}, with_bearer=False,
+        )
+        if st in (401, 403):
+            raise AuthenticationExpired(f"雨课堂账号授权已失效: HTTP {st}")
+        if not isinstance(data, dict) or data.get("code") != 0:
+            code = data.get("code") if isinstance(data, dict) else None
+            message = ("动态二维码已过期，请重新扫码"
+                       if str(code) == "51203" else "二维码解析失败")
+            raise QRCodeScanError(code, message)
+        payload = data.get("data")
+        value = payload.get("value") if isinstance(payload, dict) else None
+        if (not isinstance(payload, dict) or payload.get("type") != "checkin"
+                or value is None or not str(value).strip()):
+            raise QRCodeScanError(None, "二维码响应缺少有效课堂标识")
+        return str(value)
 
     async def checkin(self, lesson_id: str, join_if_not_in: bool = False):
-        """检测手动签到状态并返回课堂凭证，不直接修改客户端共享凭证。"""
+        """Check or explicitly join a lesson, returning credentials without mutating state."""
         body = {"source": 21, "lessonId": str(lesson_id), "joinIfNotIn": join_if_not_in}
         async with self.http.post(self.base + "/api/v3/lesson/checkin", headers=self._headers(with_bearer=False),
                                   json=body, timeout=aiohttp.ClientTimeout(total=35)) as r:
+            status = r.status
+            if status in (401, 403):
+                raise AuthenticationExpired(f"雨课堂账号授权已失效: HTTP {status}")
             data = await r.json(content_type=None)
         if not data or data.get("code") != 0:
             code = data.get("code") if data else "?"
@@ -1247,6 +1300,8 @@ class YuketangClient:
         st, _, data = await self._req(
             "GET", "/api/v3/lesson/presentation/fetch", params={"presentation_id": str(pres_id)}
         )
+        if st in (401, 403):
+            raise AuthenticationExpired(f"雨课堂课堂授权已失效: HTTP {st}")
         if data and data.get("code") == 0:
             return data.get("data")
         return None
@@ -1255,6 +1310,8 @@ class YuketangClient:
         st, _, data = await self._req(
             "GET", "/api/v3/lesson/problem/fetch-answer", params={"problem_id": str(problem_id)}
         )
+        if st in (401, 403):
+            raise AuthenticationExpired(f"雨课堂课堂授权已失效: HTTP {st}")
         return data
 
     async def submit_answer(self, problem_id, dt, problem_type, result, retry=False, timeout=None):
@@ -1268,4 +1325,6 @@ class YuketangClient:
             body = problem
         request_timeout = aiohttp.ClientTimeout(total=timeout) if timeout else None
         st, _, data = await self._req("POST", path, json=body, **({"timeout": request_timeout} if request_timeout else {}))
+        if st in (401, 403):
+            raise AuthenticationExpired(f"雨课堂课堂授权已失效: HTTP {st}")
         return data

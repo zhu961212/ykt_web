@@ -14,5 +14,12 @@ That upstream project is distributed under GPL-3.0. This notice preserves the
 project attribution; the upstream project and its contributors do not endorse
 this repository.
 
+The browser QR decoding fallback includes jsQR 1.4.0:
+
+https://github.com/cozmo/jsQR
+
+jsQR is distributed under the Apache License 2.0. Its license text is retained
+at `static/vendor/jsQR.LICENSE`.
+
 Rain Classroom, Yuketang, XuetangX, and other names may be trademarks of their
 respective owners. This repository is an independent, unofficial project.
