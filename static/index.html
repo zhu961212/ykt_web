@@ -64,7 +64,6 @@
   #appShell.settings-mode main > .col:first-child { display:contents; }
   #appShell.settings-mode .settings-heading { grid-column:1 / -1; }
   #appShell.settings-mode .admin-settings { grid-column:1 / -1; }
-  #appShell.settings-mode .scanner-settings { grid-column:1 / -1; }
   .settings-heading h2 { font-size:18px; font-weight:600; }
   .admin-form-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:0 12px; }
   [hidden] { display:none !important; }
@@ -125,7 +124,6 @@
       <div class="hint" id="qrHint">未登录</div>
       <div class="row" style="margin-top:10px">
         <button id="btnQr" class="primary" style="flex:1">添加账号</button>
-        <button id="btnScanAll" style="flex:1" disabled>扫码签到</button>
         <button id="btnLogout" style="display:none">全部退出</button>
       </div>
     </section>
@@ -135,10 +133,24 @@
       <label class="switch"><input type="checkbox" id="autoAnswer"> 自动答题并提交</label>
       <label class="switch"><input type="checkbox" id="autoStart"> 登录后自动开始监课</label>
       <div style="border-top:1px solid var(--bd);margin:6px 0"></div>
-      <div class="kv"><span>签到方式</span><b>App 手动 / 面板扫码</b></div>
+      <div class="kv"><span>签到方式</span><b>雨课堂 App 手动签到</b></div>
     </section>
 
     <div class="settings-heading settings-only"><h2>设置</h2></div>
+
+    <section class="card settings-only server-settings">
+      <h2>雨课堂服务器</h2>
+      <form id="serverForm">
+        <label class="field"><span>服务器</span><select id="rainServer" required>
+          <option value="changjiang">长江雨课堂</option>
+          <option value="yuketang">雨课堂</option>
+          <option value="pro">荷塘雨课堂</option>
+          <option value="huanghe">黄河雨课堂</option>
+        </select></label>
+        <button id="btnSaveServer" class="primary" type="submit" style="width:100%;margin-top:10px">保存服务器</button>
+        <div id="serverHint" class="hint form-message"></div>
+      </form>
+    </section>
 
     <section class="card settings-only admin-settings">
       <h2>管理员密码</h2>
@@ -149,22 +161,6 @@
         </div>
         <button id="btnSaveAdmin" class="primary" type="submit" style="width:100%;margin-top:10px">更新管理员密码</button>
         <div id="adminHint" class="hint form-message"></div>
-      </form>
-    </section>
-
-    <section class="card settings-only scanner-settings">
-      <h2 class="form-heading"><span>扫码页面</span><span id="scannerBadge" class="badge">未配置</span></h2>
-      <form id="scannerForm" autocomplete="off">
-        <label class="field"><span>页面地址</span><input id="scannerUrl" type="text" readonly></label>
-        <div class="admin-form-grid">
-          <label class="field"><span>扫码页密码</span><input id="scannerPassword" type="password" minlength="4" maxlength="128" autocomplete="new-password" required></label>
-          <label class="field"><span>确认扫码页密码</span><input id="scannerPasswordConfirm" type="password" minlength="4" maxlength="128" autocomplete="new-password" required></label>
-        </div>
-        <div class="row" style="margin-top:10px">
-          <button id="btnSaveScanner" class="primary" type="submit" style="flex:1">保存扫码页密码</button>
-          <button id="btnOpenScanner" type="button">打开扫码页</button>
-        </div>
-        <div id="scannerHint" class="hint form-message"></div>
       </form>
     </section>
 
@@ -228,6 +224,8 @@ let emailPasswordConfigured = false;
 let panelBootstrapped = false;
 let stateRefreshTimer = null;
 let adminAuthRequired = false;
+let currentServer = "changjiang";
+let serverFormDirty = false;
 
 function addLog(text, level, accountName) {
   const log = $("log");
@@ -319,11 +317,21 @@ function applyAdminState(settings) {
   }
 }
 
-function applyScannerState(settings) {
-  if (!settings) return;
-  setBadge($("scannerBadge"), settings.configured ? "已配置" : "未配置",
-           settings.configured ? "ok" : "warn");
-  $("scannerUrl").value = location.origin + (settings.path || "/scan");
+function applyServerState(settings) {
+  if (!settings || serverFormDirty) return;
+  const select = $("rainServer");
+  const options = Array.isArray(settings.options) ? settings.options : [];
+  if (options.length) {
+    select.replaceChildren();
+    for (const item of options) {
+      const option = document.createElement("option");
+      option.value = item.value;
+      option.textContent = item.label;
+      select.appendChild(option);
+    }
+  }
+  currentServer = settings.selected || "changjiang";
+  select.value = currentServer;
 }
 
 async function requestJSON(url, options) {
@@ -392,6 +400,7 @@ function applyState(state) {
   $("stAnswered").textContent = state.answered || 0;
   $("autoAnswer").checked = !!state.auto_answer;
   $("autoStart").checked = !!state.auto_start_watching;
+  applyServerState(state.server);
   applyLlmState(state.llm);
   const active = accounts.filter(account => account.logged_in);
   const watching = active.filter(account => account.watching);
@@ -404,7 +413,6 @@ function applyState(state) {
   $("btnWatch").style.display = active.some(account => !account.watching) ? "" : "none";
   $("btnStop").style.display = watching.length ? "" : "none";
   $("btnWatch").disabled = !active.length;
-  $("btnScanAll").disabled = !active.length;
   $("btnLogout").style.display = accounts.length ? "" : "none";
   if (!qrController) $("qrHint").textContent = active.length ? "可继续添加账号" : "尚未登录";
 }
@@ -440,7 +448,8 @@ function renderAccounts(accounts) {
     head.append(name, badge);
     const meta = document.createElement("div");
     meta.className = "account-meta";
-    meta.textContent = account.course_name ? account.course_name + " · " + (account.detail || "") : (account.detail || "-");
+    meta.textContent = [account.server_name, account.course_name, account.detail]
+      .filter(Boolean).join(" · ") || "-";
     const stats = document.createElement("div");
     stats.className = "account-stats";
     stats.textContent = "缓存 " + (account.problems || 0) + " 题 · 已答 " + (account.answered || 0) + " 题";
@@ -509,7 +518,7 @@ async function refreshEmailConfig() {
     const result = await requestJSON("/api/config");
     applyEmailState(result.email);
     applyAdminState(result.admin);
-    applyScannerState(result.scanner);
+    applyServerState(result.server);
   } catch (error) {
     $("emailHint").textContent = "邮件配置读取失败: " + error.message;
   }
@@ -600,7 +609,6 @@ async function watchStart() {
 }
 
 $("btnQr").onclick = qrStart;
-$("btnScanAll").onclick = () => { window.location.href = "/scan"; };
 for (const button of document.querySelectorAll("button[data-view]")) {
   button.onclick = () => {
     const view = button.dataset.view === "settings" ? "settings" : "console";
@@ -777,33 +785,37 @@ $("adminForm").onsubmit = async event => {
     button.disabled = false;
   }
 };
-$("scannerForm").onsubmit = async event => {
+$("rainServer").onchange = () => { serverFormDirty = true; };
+$("serverForm").onsubmit = async event => {
   event.preventDefault();
-  const button = $("btnSaveScanner");
-  const hint = $("scannerHint");
-  const password = $("scannerPassword").value;
-  if (password !== $("scannerPasswordConfirm").value) {
-    hint.textContent = "两次输入的扫码页密码不一致";
+  const button = $("btnSaveServer");
+  const hint = $("serverHint");
+  const selected = $("rainServer").value;
+  if (selected !== currentServer && accountStates.size
+      && !window.confirm("已有账号继续使用原服务器；新添加账号使用所选服务器。确认保存？")) {
+    serverFormDirty = false;
+    $("rainServer").value = currentServer;
     return;
   }
   button.disabled = true;
   hint.textContent = "正在保存";
   try {
-    const result = await requestJSON("/api/scanner/credentials", {
+    const result = await requestJSON("/api/config", {
       method:"POST", headers:{"content-type":"application/json"},
-      body:JSON.stringify({new_password:password})
+      body:JSON.stringify({server:selected})
     });
-    applyScannerState(result.scanner);
-    $("scannerPassword").value = "";
-    $("scannerPasswordConfirm").value = "";
-    hint.textContent = "扫码页密码已更新";
+    serverFormDirty = false;
+    applyServerState(result.server);
+    hint.textContent = "已保存";
+    addLog("新账号登录服务器已切换为 " + $("rainServer").selectedOptions[0].textContent);
   } catch (error) {
     hint.textContent = error.message;
+    serverFormDirty = false;
+    $("rainServer").value = currentServer;
   } finally {
     button.disabled = false;
   }
 };
-$("btnOpenScanner").onclick = () => window.open("/scan", "_blank", "noopener");
 function markEmailFormDirty() {
   emailFormDirty = true;
   emailConfigSaved = false;

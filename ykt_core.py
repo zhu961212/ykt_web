@@ -1029,8 +1029,8 @@ class LLMSolver:
 class YuketangClient:
     def __init__(self, cfg: dict, session: aiohttp.ClientSession):
         self.cfg = cfg
-        self.server_key = cfg.get("server", "yuketang")
-        self.base = SERVERS.get(self.server_key, SERVERS["yuketang"])
+        self.server_key = cfg.get("server", "changjiang")
+        self.base = SERVERS.get(self.server_key, SERVERS["changjiang"])
         self.http = session
         self.bearer = ""
         self.lesson_token = ""

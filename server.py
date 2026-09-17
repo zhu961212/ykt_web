@@ -32,7 +32,7 @@ SESSION_PATH = ROOT / "session.json"
 WS_HOST_SUFFIX = {"yuketang": "www.yuketang.cn"}
 
 DEFAULTS = {
-    "server": "yuketang",
+    "server": "changjiang",
     "llm": {
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
         "api_key": "",
@@ -52,6 +52,13 @@ DEFAULTS = {
     },
 }
 
+SERVER_LABELS = {
+    "changjiang": "长江雨课堂",
+    "yuketang": "雨课堂",
+    "pro": "荷塘雨课堂",
+    "huanghe": "黄河雨课堂",
+}
+
 
 def load_config() -> dict:
     loaded = {}
@@ -59,6 +66,9 @@ def load_config() -> dict:
         loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         if not isinstance(loaded, dict):
             raise ValueError("config.json 必须包含 JSON 对象")
+        if "scanner" in loaded:
+            loaded.pop("scanner", None)
+            _atomic_json_write(CONFIG_PATH, loaded)
     merged = {**DEFAULTS, **loaded}
     merged["llm"] = {**DEFAULTS["llm"], **loaded.get("llm", {})}
     merged["lesson"] = {**DEFAULTS["lesson"], **loaded.get("lesson", {})}
@@ -66,7 +76,9 @@ def load_config() -> dict:
         DEFAULTS["email"], loaded.get("email", {}),
     )
     merged["bot"] = {**DEFAULTS["bot"], **loaded.get("bot", {})}
-    # Background watching never joins a class; scan check-in requires an explicit user action.
+    if merged.get("server") not in core.SERVERS:
+        merged["server"] = "changjiang"
+    # Background watching only observes accounts that have already joined a lesson.
     merged["bot"]["wait_manual_checkin"] = True
     return merged
 
@@ -89,6 +101,19 @@ def public_email_config(config=None) -> dict:
     return emailer.public_email_settings((config or cfg).get("email", {}))
 
 
+def public_server_config(config=None) -> dict:
+    selected = str((config or cfg).get("server") or "changjiang")
+    if selected not in core.SERVERS:
+        selected = "changjiang"
+    return {
+        "selected": selected,
+        "options": [
+            {"value": value, "label": SERVER_LABELS[value]}
+            for value in ("changjiang", "yuketang", "pro", "huanghe")
+        ],
+    }
+
+
 def public_admin_config(request=None, config=None) -> dict:
     runtime = getattr(request, "app", {}).get("runtime_config", {}) if request else {}
     username = runtime.get("username")
@@ -106,16 +131,8 @@ def public_admin_config(request=None, config=None) -> dict:
     }
 
 
-def public_scanner_config(request=None, config=None) -> dict:
-    runtime = getattr(request, "app", {}).get("runtime_config", {}) if request else {}
-    configured = (bool(runtime.get("scanner_enabled")) if runtime
-                  else isinstance((config or cfg).get("scanner"), dict))
-    return {"configured": configured, "path": "/scan"}
-
-
 ADMIN_USERNAME_CHARS = frozenset(string.ascii_letters + string.digits + "-._@")
 ADMIN_PASSWORD_ITERATIONS = 310_000
-SCANNER_PASSWORD_ITERATIONS = 210_000
 
 
 def _validate_admin_username(value):
@@ -134,14 +151,6 @@ def _validate_admin_password(value, *, allow_empty=False):
         raise ValueError("管理员密码必须为 12-256 位")
     if any(not char.isprintable() for char in value):
         raise ValueError("管理员密码不能包含换行、制表符或其他控制字符")
-    return value
-
-
-def _validate_scanner_password(value):
-    if not isinstance(value, str) or not 4 <= len(value) <= 128:
-        raise ValueError("扫码页密码必须为 4-128 位")
-    if any(not char.isprintable() for char in value):
-        raise ValueError("扫码页密码不能包含换行、制表符或其他控制字符")
     return value
 
 
@@ -170,27 +179,6 @@ def _persisted_admin_credentials(config):
         "password_salt": salt,
         "password_hash": password_hash,
         "password_iterations": iterations,
-    }
-
-
-def _persisted_scanner_credentials(config):
-    value = (config or {}).get("scanner")
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise RuntimeError("config.json 的 scanner 配置无效")
-    try:
-        salt = bytes.fromhex(str(value.get("password_salt") or ""))
-        password_hash = bytes.fromhex(str(value.get("password_hash") or ""))
-        iterations = int(value.get("password_iterations") or 0)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("config.json 的扫码页凭据无效") from exc
-    if len(salt) != 16 or len(password_hash) != 32 or not 100_000 <= iterations <= 2_000_000:
-        raise RuntimeError("config.json 的扫码页凭据无效")
-    return {
-        "scanner_password_salt": salt,
-        "scanner_password_hash": password_hash,
-        "scanner_password_iterations": iterations,
     }
 
 
@@ -231,7 +219,6 @@ def server_runtime_config(environ=None, config=None) -> dict:
         raise RuntimeError("YKT_ADMIN_RESET 必须是 0 或 1")
     admin_reset_enabled = admin_reset in ("1", "true")
     persisted = None if admin_reset_enabled else _persisted_admin_credentials(config)
-    scanner = _persisted_scanner_credentials(config)
     auth_enabled = bool(password)
     if persisted is not None:
         username = persisted["username"]
@@ -249,13 +236,9 @@ def server_runtime_config(environ=None, config=None) -> dict:
         "trust_proxy": trust_proxy_enabled,
         "admin_reset": admin_reset_enabled,
         "session_secret": secrets.token_bytes(32),
-        "scanner_enabled": scanner is not None,
-        "scanner_session_secret": secrets.token_bytes(32),
     }
     if persisted is not None:
         settings.update(persisted)
-    if scanner is not None:
-        settings.update(scanner)
     return settings
 
 
@@ -575,7 +558,7 @@ class Watcher:
         self.running = True
         self.task = asyncio.create_task(self._run(), name=f"watcher-{self.account_id}")
         self.set_state("waiting", "正在查询上课课程")
-        self.hub.log("监课已启动（等待 App 手动签到或面板扫码签到）")
+        self.hub.log("监课已启动（等待雨课堂 App 手动签到）")
         return True
 
     @staticmethod
@@ -1215,6 +1198,8 @@ class AccountRuntime:
         state = dict(self.hub.state)
         state.update({
             "account_id": self.account_id,
+            "server": self.client.server_key,
+            "server_name": SERVER_LABELS.get(self.client.server_key, self.client.server_key),
             "user_id": self.client.user_id,
             "user_name": self.client.user_name,
             "logged_in": bool(self.client.user_id),
@@ -1524,6 +1509,10 @@ class AccountManager:
                 continue
             values.append({
                 "account_id": account_id,
+                "server": record.get("server", ""),
+                "server_name": SERVER_LABELS.get(
+                    record.get("server", ""), record.get("server", ""),
+                ),
                 "user_id": record.get("user_id", ""),
                 "user_name": record.get("user_name", ""),
                 "logged_in": False,
@@ -1578,7 +1567,6 @@ class QRAttempt:
 qr_attempt = None
 config_revision = 0
 AUTH_COOKIE_NAME = "ykt_admin_session"
-SCANNER_COOKIE_NAME = "ykt_scanner_session"
 
 
 def _admin_password_matches(settings, password):
@@ -1592,17 +1580,6 @@ def _admin_password_matches(settings, password):
     )
 
 
-def _scanner_password_matches(settings, password):
-    if not settings.get("scanner_enabled"):
-        return False
-    candidate = _password_digest(
-        password,
-        settings["scanner_password_salt"],
-        settings["scanner_password_iterations"],
-    )
-    return hmac.compare_digest(candidate, settings["scanner_password_hash"])
-
-
 def _admin_session_token(settings, issued_at=None):
     issued_at = int(time.time()) if issued_at is None else int(issued_at)
     message = f"ykt-web-admin-session-v1\0{settings['username']}\0{issued_at}".encode("utf-8")
@@ -1611,18 +1588,6 @@ def _admin_session_token(settings, issued_at=None):
     signature = hmac.new(
         key, message, hashlib.sha256,
     ).hexdigest()
-    return f"{issued_at}.{signature}"
-
-
-def _scanner_session_token(settings, issued_at=None):
-    issued_at = int(time.time()) if issued_at is None else int(issued_at)
-    message = f"ykt-web-scanner-session-v1\0{issued_at}".encode("utf-8")
-    key = hmac.new(
-        settings["scanner_password_hash"],
-        settings["scanner_session_secret"],
-        hashlib.sha256,
-    ).digest()
-    signature = hmac.new(key, message, hashlib.sha256).hexdigest()
     return f"{issued_at}.{signature}"
 
 
@@ -1636,14 +1601,6 @@ def _secure_cookie_required(request, settings):
 def _set_admin_session_cookie(response, request, settings):
     response.set_cookie(
         AUTH_COOKIE_NAME, _admin_session_token(settings), max_age=30 * 24 * 60 * 60,
-        httponly=True, secure=_secure_cookie_required(request, settings),
-        samesite="Strict", path="/",
-    )
-
-
-def _set_scanner_session_cookie(response, request, settings):
-    response.set_cookie(
-        SCANNER_COOKIE_NAME, _scanner_session_token(settings), max_age=24 * 60 * 60,
         httponly=True, secure=_secure_cookie_required(request, settings),
         samesite="Strict", path="/",
     )
@@ -1687,13 +1644,6 @@ def _request_is_authenticated(request):
     )
 
 
-def _request_is_scanner_authenticated(request):
-    settings = request.app["runtime_config"]
-    return bool(settings.get("scanner_enabled")) and _request_cookie_is_valid(
-        request, SCANNER_COOKIE_NAME, _scanner_session_token, 24 * 60 * 60,
-    )
-
-
 def _admin_session_age(request):
     supplied = request.cookies.get(AUTH_COOKIE_NAME, "")
     try:
@@ -1706,21 +1656,12 @@ def _admin_session_age(request):
 @web.middleware
 async def admin_auth_middleware(request, handler):
     public_requests = {
-        ("GET", "/"), ("GET", "/scan"), ("GET", "/api/health"),
+        ("GET", "/"), ("GET", "/api/health"),
         ("GET", "/api/auth/status"), ("POST", "/api/auth/login"),
-        ("GET", "/api/scanner/status"), ("POST", "/api/scanner/login"),
-    }
-    scanner_requests = {
-        ("POST", "/api/accounts/scan-all"), ("POST", "/api/scanner/logout"),
     }
     request_key = (request.method, request.path)
     settings = request.app["runtime_config"]
-    if request_key in public_requests or (
-            request.method == "GET" and request.path.startswith("/vendor/")):
-        return await handler(request)
-    if (request_key in scanner_requests
-            and (_request_is_authenticated(request)
-                 or _request_is_scanner_authenticated(request))):
+    if request_key in public_requests:
         return await handler(request)
     if not settings["auth_enabled"] or _request_is_authenticated(request):
         return await handler(request)
@@ -1796,6 +1737,7 @@ def public_state() -> dict:
         state["auto_start_watching"] = cfg["bot"].get("auto_start_watching", True)
         state["auto_answer"] = not cfg["bot"].get("dry_run", True)
         state["manual_checkin"] = True
+        state["server"] = public_server_config()
         state["llm"] = public_llm_config()
         return state
     state = dict(hub.state)
@@ -1807,6 +1749,7 @@ def public_state() -> dict:
     state["auto_start_watching"] = cfg["bot"].get("auto_start_watching", True)
     state["auto_answer"] = not cfg["bot"].get("dry_run", True)
     state["manual_checkin"] = True
+    state["server"] = public_server_config()
     state["llm"] = public_llm_config()
     return state
 
@@ -1851,10 +1794,6 @@ async def _supersede_qr_attempt() -> int:
 
 async def index(request):
     return web.FileResponse(ROOT / "static" / "index.html", headers={"Cache-Control": "no-store"})
-
-
-async def scanner_page(request):
-    return web.FileResponse(ROOT / "static" / "scan.html", headers={"Cache-Control": "no-store"})
 
 
 async def api_auth_status(request):
@@ -1943,140 +1882,6 @@ async def api_auth_logout(request):
     response = web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
     response.del_cookie(AUTH_COOKIE_NAME, path="/")
     return response
-
-
-async def api_scanner_status(request):
-    settings = request.app["runtime_config"]
-    admin_authenticated = _request_is_authenticated(request)
-    return web.json_response({
-        "configured": bool(settings.get("scanner_enabled")),
-        "authenticated": (admin_authenticated
-                          or _request_is_scanner_authenticated(request)),
-        "admin": admin_authenticated,
-    }, headers={"Cache-Control": "no-store"})
-
-
-async def api_scanner_login(request):
-    request_error = _local_json_request_error(request)
-    if request_error is not None:
-        return request_error
-    body = await request.json()
-    if not isinstance(body, dict) or set(body) != {"password"}:
-        raise ValueError("扫码页登录需要 password")
-    password = body.get("password")
-    if not isinstance(password, str) or len(password) > 128:
-        raise ValueError("扫码页密码无效")
-    settings = request.app["runtime_config"]
-    if not settings.get("scanner_enabled"):
-        return web.json_response(
-            {"ok": False, "message": "管理员尚未配置扫码页密码"}, status=409,
-        )
-
-    remote = _request_client_id(request)
-    now = time.monotonic()
-    async with request.app["scanner_auth_lock"]:
-        failures = request.app["scanner_auth_failures"]
-        if len(failures) >= 1024:
-            stale = [key for key, value in failures.items()
-                     if now - value.get("last_seen", 0.0) > 600]
-            for key in stale:
-                failures.pop(key, None)
-            while len(failures) >= 1024:
-                failures.pop(next(iter(failures)))
-        state = failures.get(remote, {
-            "count": 0, "blocked_until": 0.0, "last_seen": now,
-        })
-        state["last_seen"] = now
-        if state["blocked_until"] > now:
-            return web.json_response(
-                {"ok": False, "message": "登录尝试过于频繁，请稍后再试"},
-                status=429, headers={"Cache-Control": "no-store"},
-            )
-        valid = await asyncio.to_thread(_scanner_password_matches, settings, password)
-        if not valid:
-            state["count"] += 1
-            if state["count"] >= 5:
-                state = {"count": 0, "blocked_until": now + 60, "last_seen": now}
-            failures[remote] = state
-            return web.json_response(
-                {"ok": False, "message": "扫码页密码错误"}, status=401,
-                headers={"Cache-Control": "no-store"},
-            )
-        failures.pop(remote, None)
-        response = web.json_response(
-            {"ok": True, "authenticated": True}, headers={"Cache-Control": "no-store"},
-        )
-        _set_scanner_session_cookie(response, request, settings)
-        return response
-
-
-async def api_scanner_logout(request):
-    request_error = _local_json_request_error(request)
-    if request_error is not None:
-        return request_error
-    await request.json()
-    async with request.app["scanner_auth_lock"]:
-        if (not _request_is_authenticated(request)
-                and not _request_is_scanner_authenticated(request)):
-            return web.json_response(
-                {"ok": False, "message": "扫码页登录已失效，请重新登录"}, status=401,
-            )
-        request.app["runtime_config"]["scanner_session_secret"] = secrets.token_bytes(32)
-    response = web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
-    response.del_cookie(SCANNER_COOKIE_NAME, path="/")
-    return response
-
-
-async def api_scanner_credentials(request):
-    request_error = _local_json_request_error(request)
-    if request_error is not None:
-        return request_error
-    body = await request.json()
-    if not isinstance(body, dict) or set(body) != {"new_password"}:
-        raise ValueError("扫码页密码请求字段不完整")
-    password = _validate_scanner_password(body.get("new_password"))
-
-    async with request.app["auth_lock"]:
-        if not _request_is_authenticated(request):
-            return web.json_response(
-                {"ok": False, "message": "管理员登录已失效，请重新登录"}, status=401,
-            )
-        settings = request.app["runtime_config"]
-        if settings["auth_enabled"]:
-            age = _admin_session_age(request)
-            if age is None or age > 10 * 60:
-                return web.json_response(
-                    {"ok": False, "message": "请重新登录后再设置扫码页密码"}, status=403,
-                )
-        async with request.app["scanner_auth_lock"]:
-            async with request.app["config_lock"]:
-                salt = secrets.token_bytes(16)
-                password_hash = await asyncio.to_thread(
-                    _password_digest, password, salt, SCANNER_PASSWORD_ITERATIONS,
-                )
-                scanner_record = {
-                    "password_salt": salt.hex(),
-                    "password_hash": password_hash.hex(),
-                    "password_iterations": SCANNER_PASSWORD_ITERATIONS,
-                }
-                next_cfg = {**cfg, "scanner": scanner_record}
-                save_config(next_cfg)
-                cfg.clear()
-                cfg.update(next_cfg)
-                settings = request.app["runtime_config"]
-                settings.update({
-                    "scanner_enabled": True,
-                    "scanner_password_salt": salt,
-                    "scanner_password_hash": password_hash,
-                    "scanner_password_iterations": SCANNER_PASSWORD_ITERATIONS,
-                    "scanner_session_secret": secrets.token_bytes(32),
-                })
-
-    hub.log("扫码页访问密码已更新", "warn")
-    return web.json_response(
-        {"ok": True, "scanner": public_scanner_config(request)},
-        headers={"Cache-Control": "no-store"},
-    )
 
 
 async def api_admin_credentials(request):
@@ -2594,6 +2399,14 @@ async def api_config(request):
         auto_start_changed = False
         llm_changed = False
         email_changed = False
+        server_changed = False
+        if "server" in body:
+            selected_server = body["server"]
+            if not isinstance(selected_server, str) or selected_server not in core.SERVERS:
+                raise ValueError("不支持的雨课堂服务器")
+            server_changed = selected_server != next_cfg.get("server")
+            next_cfg["server"] = selected_server
+            changed = changed or server_changed
         if "auto_answer" in body and "dry_run" in body:
             raise ValueError("auto_answer 与 dry_run 不能同时设置")
         if "auto_answer" in body or "dry_run" in body:
@@ -2694,12 +2507,15 @@ async def api_config(request):
                 hub.log(f"模型配置已更新: {cfg['llm']['model']}")
             if email_changed:
                 hub.log("邮件通知配置已更新")
+            if server_changed:
+                await _supersede_qr_attempt()
+                hub.log(f"新账号登录服务器 => {SERVER_LABELS[cfg['server']]}")
             await hub.sync_state()
         response = {"ok": True, "manual_checkin": True,
                     "revision": config_revision, "llm": public_llm_config(next_cfg),
                     "email": public_email_config(next_cfg),
-                    "admin": public_admin_config(request, next_cfg),
-                    "scanner": public_scanner_config(request, next_cfg)}
+                    "server": public_server_config(next_cfg),
+                    "admin": public_admin_config(request, next_cfg)}
     return web.json_response(response, headers={"Cache-Control": "no-store"})
 
 
@@ -2709,10 +2525,10 @@ async def api_config_get(request):
         "auto_answer": not cfg["bot"].get("dry_run", True),
         "auto_start_watching": cfg["bot"].get("auto_start_watching", True),
         "revision": config_revision,
+        "server": public_server_config(),
         "llm": public_llm_config(),
         "email": public_email_config(),
         "admin": public_admin_config(request),
-        "scanner": public_scanner_config(request),
     }, headers={"Cache-Control": "no-store"})
 
 
@@ -2845,23 +2661,13 @@ def make_app() -> web.Application:
     app["runtime_config"] = server_runtime_config(config=cfg)
     app["auth_lock"] = asyncio.Lock()
     app["auth_failures"] = {}
-    app["scanner_auth_lock"] = asyncio.Lock()
-    app["scanner_auth_failures"] = {}
-    app["scan_lock"] = asyncio.Lock()
-    app["last_scan_at"] = 0.0
     app["config_lock"] = asyncio.Lock()
     app.router.add_get("/", index)
-    app.router.add_get("/scan", scanner_page)
-    app.router.add_static("/vendor/", ROOT / "static" / "vendor", show_index=False)
     app.router.add_get("/api/health", api_health)
     app.router.add_get("/api/auth/status", api_auth_status)
     app.router.add_post("/api/auth/login", api_auth_login)
     app.router.add_post("/api/auth/logout", api_auth_logout)
     app.router.add_post("/api/admin/credentials", api_admin_credentials)
-    app.router.add_get("/api/scanner/status", api_scanner_status)
-    app.router.add_post("/api/scanner/login", api_scanner_login)
-    app.router.add_post("/api/scanner/logout", api_scanner_logout)
-    app.router.add_post("/api/scanner/credentials", api_scanner_credentials)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/api/state", api_state)
     app.router.add_post("/api/login/qr/start", api_login_qr_start)
@@ -2875,7 +2681,6 @@ def make_app() -> web.Application:
     app.router.add_post("/api/accounts/{account_id}/watch/stop", api_account_watch_stop)
     app.router.add_post("/api/accounts/{account_id}/watch/join", api_account_watch_join)
     app.router.add_post("/api/accounts/{account_id}/remove", api_account_remove)
-    app.router.add_post("/api/accounts/scan-all", api_accounts_scan_all)
     app.router.add_get("/api/config", api_config_get)
     app.router.add_post("/api/config", api_config)
     app.router.add_post("/api/config/llm/models", api_llm_models)
