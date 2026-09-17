@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 
@@ -53,9 +54,102 @@ class DeployScriptHttpsTests(unittest.TestCase):
             [bash, "-c", shell, "domain-validator", encoded],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=False,
         )
+
+    def run_caddy_package_installer(self, *, candidate, install_fails, installed=False):
+        bash = _bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+        functions = self.section("caddy_package_installed() {", "check_caddy_file() {")
+        shell = (
+            "TRACE=''\n"
+            f"FAKE_CANDIDATE={int(candidate)}\n"
+            f"FAKE_INSTALL_FAILS={int(install_fails)}\n"
+            f"FAKE_INSTALLED={int(installed)}\n"
+            "trace() { TRACE=\"${TRACE}${TRACE:+,}$*\"; }\n"
+            "log() { :; }\n"
+            "warn() { :; }\n"
+            "caddy() { :; }\n"
+            "dpkg-query() { (( FAKE_INSTALLED )) && printf 'install ok installed'; }\n"
+            "apt-cache() { (( FAKE_CANDIDATE )) && printf '  Candidate: 2.10.2\\n' || printf '  Candidate: (none)\\n'; }\n"
+            "configure_caddy_apt_repository() { trace repo; FAKE_CANDIDATE=1; }\n"
+            "apt-get() {\n"
+            "  trace \"apt-get:$*\"\n"
+            "  if [[ \"$*\" == 'install -y caddy' ]]; then\n"
+            "    (( FAKE_INSTALL_FAILS )) && return 1\n"
+            "    FAKE_INSTALLED=1\n"
+            "  fi\n"
+            "  return 0\n"
+            "}\n"
+            + functions
+            + "\nif install_caddy_package; then result=0; else result=$?; fi\n"
+            + "printf 'result=%s\\ntrace=%s\\n' \"$result\" \"$TRACE\"\n"
+        )
+        return subprocess.run(
+            [bash, "-c", shell], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=10, check=False,
+        )
+
+    def run_caddy_repo_configurator(self, *, fail_dearmor):
+        bash = _bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+        function = self.section(
+            "configure_caddy_apt_repository() (", "caddy_package_installed() {",
+        )
+        function = function.replace(
+            "/usr/share/keyrings/caddy-stable-archive-keyring.gpg",
+            "$TEST_ROOT/keyrings/caddy.gpg",
+        ).replace(
+            "/etc/apt/sources.list.d/caddy-stable.list",
+            "$TEST_ROOT/sources/caddy.list",
+        ).replace(
+            "/usr/share/keyrings", "$TEST_ROOT/keyrings",
+        ).replace(
+            "/etc/apt/sources.list.d", "$TEST_ROOT/sources",
+        )
+        shell = (
+            "if command -v cygpath >/dev/null 2>&1; then TEST_ROOT=\"$(cygpath -u \"$1\")\"; else TEST_ROOT=\"$1\"; fi\n"
+            "ADMIN_DIR=\"$TEST_ROOT/admin\"\n"
+            f"FAIL_DEARMOR={int(fail_dearmor)}\n"
+            "mkdir -p \"$ADMIN_DIR\"\n"
+            "warn() { :; }\n"
+            "apt-get() { return 0; }\n"
+            "write_output_arg() {\n"
+            "  local previous='' argument output=''\n"
+            "  for argument in \"$@\"; do\n"
+            "    [[ \"$previous\" == '--output' ]] && output=\"$argument\"\n"
+            "    previous=\"$argument\"\n"
+            "  done\n"
+            "  [[ -n \"$output\" ]] && printf 'data' > \"$output\"\n"
+            "}\n"
+            "curl() { write_output_arg \"$@\"; }\n"
+            "gpg() {\n"
+            "  if [[ \" $* \" == *' --show-keys '* ]]; then\n"
+            "    printf 'pub:::::::::\\nfpr:::::::::65760C51EDEA2017CEA2CA15155B6D79CA56EA34:\\n'\n"
+            "    return 0\n"
+            "  fi\n"
+            "  if [[ \" $* \" == *' --dearmor '* ]]; then\n"
+            "    (( FAIL_DEARMOR )) && return 1\n"
+            "    write_output_arg \"$@\"\n"
+            "  fi\n"
+            "}\n"
+            + function
+            + "\nif configure_caddy_apt_repository; then result=0; else result=$?; fi\n"
+            + "key=$(test -e \"$TEST_ROOT/keyrings/caddy.gpg\" && echo yes || echo no)\n"
+            + "source=$(test -e \"$TEST_ROOT/sources/caddy.list\" && echo yes || echo no)\n"
+            + "printf 'result=%s\\nkey=%s\\nsource=%s\\n' \"$result\" \"$key\" \"$source\"\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            return subprocess.run(
+                [bash, "-c", shell, "repo-configurator", directory],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=10, check=False,
+            )
 
     def test_executable_help_documents_domain_modes(self):
         bash = _bash_executable()
@@ -66,6 +160,8 @@ class DeployScriptHttpsTests(unittest.TestCase):
             cwd=ROOT,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=False,
         )
@@ -144,6 +240,64 @@ class DeployScriptHttpsTests(unittest.TestCase):
             'release_stamp="$(date -u',
         )
         self.assertIn("restore_https_proxy", same_release)
+
+    def test_apt_fallback_uses_pinned_official_caddy_repository(self):
+        repository = self.section(
+            "configure_caddy_apt_repository() (", "install_caddy_package() {",
+        )
+        installer = self.section("install_caddy_package() {", "check_caddy_file() {")
+        self.assertIn(
+            "65760C51EDEA2017CEA2CA15155B6D79CA56EA34", repository,
+        )
+        self.assertIn(
+            "https://dl.cloudsmith.io/public/caddy/stable/gpg.key", repository,
+        )
+        self.assertIn(
+            "https://dl.cloudsmith.io/public/caddy/stable/deb/debian", repository,
+        )
+        self.assertIn("--show-keys --with-colons", repository)
+        self.assertIn("--dearmor", repository)
+        self.assertIn("--no-options --homedir", repository)
+        self.assertIn('public_key_count" != "1"', repository)
+        self.assertIn("--proto '=https' --tlsv1.2", repository)
+        self.assertNotRegex(repository, r"curl[^\n]*\|\s*(bash|sh)\b")
+        self.assertIn("configure_caddy_apt_repository", installer)
+        self.assertIn("apt-cache policy caddy", installer)
+        self.assertIn("caddy_package_installed", repository)
+        self.assertIn("dpkg-query -W", repository)
+        self.assertEqual(installer.count("apt-get install -y caddy"), 1)
+
+    def test_apt_fallback_only_runs_when_no_package_candidate_exists(self):
+        missing = self.run_caddy_package_installer(
+            candidate=False, install_fails=False,
+        )
+        self.assertEqual(missing.returncode, 0, missing.stderr)
+        self.assertIn("result=0", missing.stdout)
+        self.assertIn(
+            "trace=apt-get:update,repo,apt-get:update,apt-get:install -y caddy",
+            missing.stdout,
+        )
+
+        broken = self.run_caddy_package_installer(
+            candidate=True, install_fails=True,
+        )
+        self.assertEqual(broken.returncode, 0, broken.stderr)
+        self.assertIn("result=1", broken.stdout)
+        self.assertNotIn("repo", broken.stdout)
+
+        complete = self.run_caddy_package_installer(
+            candidate=True, install_fails=False, installed=True,
+        )
+        self.assertEqual(complete.returncode, 0, complete.stderr)
+        self.assertIn("result=0", complete.stdout)
+        self.assertIn("trace=\n", complete.stdout)
+
+    def test_repository_setup_stops_when_key_dearmor_fails(self):
+        completed = self.run_caddy_repo_configurator(fail_dearmor=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("result=1", completed.stdout)
+        self.assertIn("key=no", completed.stdout)
+        self.assertIn("source=no", completed.stdout)
 
     def test_caddyfile_metadata_and_failed_rollback_backup_are_preserved(self):
         restore = self.section("restore_https_proxy() {", "finalize_https_proxy() {")

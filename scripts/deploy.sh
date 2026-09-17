@@ -868,11 +868,124 @@ capture_caddy_transaction() {
     CADDY_TRANSACTION_ACTIVE=1
 }
 
+configure_caddy_apt_repository() (
+    set -Eeuo pipefail
+    local temp_dir key_file keyring_file source_file key_metadata fingerprint public_key_count
+    local expected_fingerprint="65760C51EDEA2017CEA2CA15155B6D79CA56EA34"
+    local key_url="https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
+    local keyring_path="/usr/share/keyrings/caddy-stable-archive-keyring.gpg"
+    local source_path="/etc/apt/sources.list.d/caddy-stable.list"
+    local source_line="deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main"
+
+    check_existing_repo_file() {
+        local path="$1" owner mode mode_value
+        [[ -f "$path" && ! -L "$path" ]] || return 1
+        owner="$(stat -c '%u' -- "$path")" || return 1
+        mode="$(stat -c '%a' -- "$path")" || return 1
+        mode_value=$((8#$mode))
+        [[ "$owner" == "0" && $((mode_value & 8#022)) -eq 0 ]]
+    }
+
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        ca-certificates curl gnupg debian-keyring debian-archive-keyring apt-transport-https || exit 1
+    temp_dir="$(mktemp -d "$ADMIN_DIR/.caddy-apt.XXXXXX")" || exit 1
+    trap 'rm -rf -- "$temp_dir"; rm -f -- "$keyring_path.next.$$" "$source_path.next.$$"' EXIT
+    install -d -m 0700 -- "$temp_dir/gnupg" || exit 1
+    key_file="$temp_dir/caddy.asc"
+    keyring_file="$temp_dir/caddy.gpg"
+    source_file="$temp_dir/caddy.list"
+
+    curl --fail --silent --show-error --location \
+        --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 15 --max-time 120 \
+        --output "$key_file" "$key_url" || exit 1
+    key_metadata="$(
+        gpg --batch --no-options --homedir "$temp_dir/gnupg" \
+            --show-keys --with-colons "$key_file" 2>/dev/null
+    )" || exit 1
+    public_key_count="$(printf '%s\n' "$key_metadata" | \
+        awk -F: '$1 == "pub" { count += 1 } END { print count + 0 }')" || exit 1
+    fingerprint="$(printf '%s\n' "$key_metadata" | \
+        awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" { print toupper($10); exit }')" || exit 1
+    if [[ "$public_key_count" != "1" || "$fingerprint" != "$expected_fingerprint" ]]; then
+        warn "Caddy repository signing key fingerprint mismatch"
+        exit 1
+    fi
+    gpg --batch --yes --no-options --homedir "$temp_dir/gnupg" --dearmor \
+        --output "$keyring_file" "$key_file" || exit 1
+    printf '%s\n' "$source_line" > "$source_file" || exit 1
+
+    if [[ -e "$keyring_path" ]]; then
+        check_existing_repo_file "$keyring_path" || {
+            warn "Refusing unsafe Caddy keyring path: $keyring_path"
+            exit 1
+        }
+        key_metadata="$(
+            gpg --batch --no-options --homedir "$temp_dir/gnupg" \
+                --show-keys --with-colons "$keyring_path" 2>/dev/null
+        )" || exit 1
+        public_key_count="$(printf '%s\n' "$key_metadata" | \
+            awk -F: '$1 == "pub" { count += 1 } END { print count + 0 }')" || exit 1
+        fingerprint="$(printf '%s\n' "$key_metadata" | \
+            awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" { print toupper($10); exit }')" || exit 1
+        [[ "$public_key_count" == "1" && "$fingerprint" == "$expected_fingerprint" ]] || {
+            warn "Existing Caddy keyring has an unexpected fingerprint"
+            exit 1
+        }
+    else
+        install -d -o root -g root -m 0755 -- /usr/share/keyrings || exit 1
+        install -o root -g root -m 0644 -- \
+            "$keyring_file" "$keyring_path.next.$$" || exit 1
+        mv -f -- "$keyring_path.next.$$" "$keyring_path" || exit 1
+    fi
+
+    if [[ -e "$source_path" ]]; then
+        check_existing_repo_file "$source_path" || {
+            warn "Refusing unsafe Caddy APT source path: $source_path"
+            exit 1
+        }
+        cmp -s -- "$source_file" "$source_path" || {
+            warn "Existing Caddy APT source differs from the expected stable repository"
+            exit 1
+        }
+    else
+        install -d -o root -g root -m 0755 -- /etc/apt/sources.list.d || exit 1
+        install -o root -g root -m 0644 -- \
+            "$source_file" "$source_path.next.$$" || exit 1
+        mv -f -- "$source_path.next.$$" "$source_path" || exit 1
+    fi
+)
+
+caddy_package_installed() {
+    command -v caddy >/dev/null 2>&1 || return 1
+    if command -v dpkg-query >/dev/null 2>&1; then
+        [[ "$(LC_ALL=C dpkg-query -W -f='${Status}' caddy 2>/dev/null || true)" == \
+           "install ok installed" ]]
+    elif command -v rpm >/dev/null 2>&1; then
+        rpm -q caddy >/dev/null 2>&1
+    else
+        return 0
+    fi
+}
+
 install_caddy_package() {
-    command -v caddy >/dev/null 2>&1 && return 0
+    local candidate
+    caddy_package_installed && return 0
     log "Installing Caddy for automatic HTTPS"
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update || return 1
+        candidate="$(LC_ALL=C apt-cache policy caddy 2>/dev/null | \
+            awk '/Candidate:/ { print $2; exit }')" || return 1
+        if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
+            warn "Caddy is unavailable from the current APT sources; adding the official signed repository"
+            configure_caddy_apt_repository || return 1
+            apt-get update || return 1
+            candidate="$(LC_ALL=C apt-cache policy caddy 2>/dev/null | \
+                awk '/Candidate:/ { print $2; exit }')" || return 1
+            [[ -n "$candidate" && "$candidate" != "(none)" ]] || {
+                warn "The official Caddy repository has no installable package candidate"
+                return 1
+            }
+        fi
         DEBIAN_FRONTEND=noninteractive apt-get install -y caddy || return 1
     elif command -v dnf >/dev/null 2>&1; then
         dnf install -y caddy || return 1
@@ -882,8 +995,8 @@ install_caddy_package() {
         warn "No supported package manager was found; install Caddy and retry"
         return 1
     fi
-    command -v caddy >/dev/null 2>&1 || {
-        warn "Caddy is unavailable from the configured package repositories"
+    caddy_package_installed || {
+        warn "Caddy did not reach a complete package installation state"
         return 1
     }
 }
@@ -991,7 +1104,7 @@ activate_https_proxy() {
         return 0
     fi
     set_caddy_paths
-    exec 8>"/run/lock/ykt-web-caddy.lock"
+    exec 8>"/run/lock/ykt-web-caddy.lock" || return 1
     flock -n 8 || {
         warn "Another Caddy configuration change is in progress"
         return 1
@@ -1046,7 +1159,7 @@ activate_https_proxy() {
                 "$CADDY_IMPORT_BEGIN" "$CADDY_IMPORT_LINE" "$CADDY_IMPORT_END" \
                 >> "$main_next" || return 1
         fi
-        cat > "$site_next" <<EOF
+        cat > "$site_next" <<EOF || return 1
 $CADDY_SITE_MARKER
 $DOMAIN {
     encode zstd gzip
@@ -1078,7 +1191,7 @@ EOF
             mv -f -- "$CADDY_MAIN_CONFIG.next.$$" "$CADDY_MAIN_CONFIG" || return 1
             CADDY_CONFIG_CHANGED=1
         fi
-        rm -f -- "$main_next" "$site_next"
+        rm -f -- "$main_next" "$site_next" || return 1
     fi
 
     caddy validate --config "$CADDY_MAIN_CONFIG" --adapter caddyfile || {

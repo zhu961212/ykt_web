@@ -78,7 +78,7 @@ cp config.example.json config.json
 - 将域名的 `A` 记录指向服务器公网 IPv4；只有服务器确实可通过 IPv6 访问时才保留 `AAAA` 记录
 - 在云安全组和服务器防火墙中放行 TCP `80`、`443`
 - 确认没有其他 Web 服务占用 `80`、`443`；已有 Nginx、Apache 或 Caddy 的服务器应改用下文的“已有反向代理”方式
-- 确认服务器可以访问软件源和公开证书签发服务；如果系统软件源不提供 Caddy，请先按 Caddy 官方文档安装
+- 确认服务器可以访问软件源、Caddy 官方签名仓库和公开证书签发服务
 
 随后在支持 systemd 的 Linux 服务器上执行。`--domain` 只填写域名，不要包含 `https://`、端口或路径：
 
@@ -88,7 +88,7 @@ cd ykt_web
 sudo bash scripts/deploy.sh --domain panel.example.com
 ```
 
-域名模式会安装并配置 Caddy，由 Caddy 监听公网 `80/443`、申请并自动续期证书，再将 HTTP 和 WebSocket 请求转发到 `127.0.0.1:8765`。Python 服务仍以非 root 账号运行，不会直接监听特权端口 `443`；部署器还会自动启用安全 Cookie 和本机反向代理信任。完成后访问 `https://panel.example.com/`，无需附加端口。首次签发证书可能需要短暂等待。
+域名模式会安装并配置 Caddy；系统软件源没有 `caddy` 时，部署器会核对官方仓库签名密钥指纹并添加 Caddy stable 软件源。Caddy 监听公网 `80/443`、申请并自动续期证书，再将 HTTP 和 WebSocket 请求转发到 `127.0.0.1:8765`。Python 服务仍以非 root 账号运行，不会直接监听特权端口 `443`；部署器还会自动启用安全 Cookie 和本机反向代理信任。完成后访问 `https://panel.example.com/`，无需附加端口。首次签发证书可能需要短暂等待。
 
 不要把应用的 `--port` 设置为 `443`。公网只需开放 `80/443`，不应开放后端端口 `8765`。手机浏览器的摄像头扫码要求 HTTPS，因此公网扫码页也应使用上述域名地址。
 
@@ -154,6 +154,8 @@ curl -I https://panel.example.com/
 ```
 
 后端健康检查成功但 HTTPS 仍失败时，通常是域名尚未解析到当前服务器、不可达的 `AAAA` 记录、云安全组或防火墙未放行 `80/443`，或者端口已被其他服务占用。证书签发依赖公网能够通过域名访问服务器，单纯把域名解析到 IP 并不会绕过这些条件。
+
+首次部署如果在 Caddy 安装或 HTTPS 配置阶段失败，安装器会停止服务并保留失败候选。修复网络或更新安装器后，回到最初克隆的项目目录执行 `git pull`，再重新运行同一条 `sudo bash scripts/deploy.sh --domain ...` 命令即可；无需删除 `/opt/ykt-web`。首次部署成功前，`/opt/ykt-web/admin/deploy.sh` 可能尚不存在。
 
 ### 检查与安装更新
 
