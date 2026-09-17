@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """雨课堂核心库: HTTP 客户端 / LLM 解题 / 题目解析 / RSA 加密
 
-接口规格来源: 官方 APK (com.xuetangx.ykt) Dart AOT 快照 + course_helper 交叉验证
+接口规格来源: 官方 APK (com.xuetangx.ykt) Dart AOT 快照
 认证链路: checkin -> Set-Auth 头(bearer) + data.lessonToken(WS 鉴权)
 """
 import asyncio
@@ -1212,28 +1212,46 @@ class YuketangClient:
         return normalized
 
     async def get_on_lesson(self):
-        """Return active lessons from the endpoint used by the current official clients."""
+        """Return active lessons from the endpoint extracted from the official APK."""
         path = "/api/v3/classroom/on-lesson-upcoming-exam"
-        try:
-            status, _, payload = await self._req("GET", path)
-        except Exception as exc:
-            self.lesson_discovery = {"latest": {"ok": False, "error": type(exc).__name__}}
-            raise RuntimeError(f"查询正在上课课程失败: {type(exc).__name__}") from exc
+        retryable_statuses = {502, 503, 504}
+        last_error = None
+        valid = False
 
-        data = payload.get("data") if isinstance(payload, dict) else None
-        values = data.get("onLessonClassrooms") if isinstance(data, dict) else None
-        if status in (401, 403):
-            self.lesson_discovery = {
-                "latest": {"ok": False, "http": status, "auth_expired": True}
-            }
-            raise AuthenticationExpired(f"雨课堂账号授权已失效: HTTP {status}")
-        if (status >= 400 or not isinstance(payload, dict) or payload.get("code") != 0
-                or not isinstance(data, dict) or not isinstance(values, list)):
+        for attempt in range(2):
+            try:
+                status, _, payload = await self._req("GET", path)
+            except Exception as exc:
+                last_error = {"error": type(exc).__name__}
+                break
+
+            if status in (401, 403):
+                self.lesson_discovery = {"latest": {
+                    "ok": False, "http": status, "auth_expired": True,
+                }}
+                raise AuthenticationExpired(f"雨课堂账号授权已失效: HTTP {status}")
+
+            data = payload.get("data") if isinstance(payload, dict) else None
+            values = data.get("onLessonClassrooms") if isinstance(data, dict) else None
             code = payload.get("code") if isinstance(payload, dict) else None
-            self.lesson_discovery = {
-                "latest": {"ok": False, "http": status, "code": code}
-            }
-            raise RuntimeError(f"查询正在上课课程失败: HTTP {status}, code={code}")
+            valid = (status < 400 and isinstance(payload, dict) and code == 0
+                     and isinstance(data, dict) and isinstance(values, list))
+            if valid:
+                break
+            last_error = {"http": status, "code": code}
+            if attempt == 0 and status in retryable_statuses:
+                await asyncio.sleep(1)
+                continue
+            break
+
+        if not valid:
+            latest = {"ok": False, **(last_error or {})}
+            self.lesson_discovery = {"latest": latest}
+            if "error" in latest:
+                raise RuntimeError(f"查询正在上课课程失败: {latest['error']}")
+            raise RuntimeError(
+                f"查询正在上课课程失败: HTTP {latest.get('http')}, code={latest.get('code')}"
+            )
 
         rooms = [self._normalize_lesson_room(item) for item in values]
         rooms = [item for item in rooms if item]

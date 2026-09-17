@@ -1215,19 +1215,56 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(client.lesson_discovery["latest"]["count"], 0)
 
-    async def test_get_on_lesson_does_not_hide_latest_endpoint_failure(self):
+    async def test_get_on_lesson_reports_repeated_official_endpoint_failure(self):
         client = core.YuketangClient({"server": "yuketang"}, object())
-        request = mock.AsyncMock(return_value=(503, {}, {
-            "code": 503, "message": "temporarily unavailable",
-        }))
+        request = mock.AsyncMock(side_effect=[
+            (503, {}, {"code": 503, "message": "temporarily unavailable"}),
+            (503, {}, {"code": 503, "message": "temporarily unavailable"}),
+        ])
 
-        with mock.patch.object(client, "_req", request):
+        with mock.patch.object(client, "_req", request), \
+                mock.patch.object(core.asyncio, "sleep", new=mock.AsyncMock()) as sleep:
             with self.assertRaisesRegex(RuntimeError, r"HTTP 503, code=503"):
+                await client.get_on_lesson()
+
+        self.assertEqual(request.await_args_list, [
+            mock.call("GET", "/api/v3/classroom/on-lesson-upcoming-exam"),
+            mock.call("GET", "/api/v3/classroom/on-lesson-upcoming-exam"),
+        ])
+        sleep.assert_awaited_once_with(1)
+
+    async def test_get_on_lesson_retries_official_endpoint_after_gateway_timeout(self):
+        client = core.YuketangClient({"server": "yuketang"}, object())
+        recovered_room = {"lessonId": "lesson-recovered", "courseName": "Recovered"}
+        request = mock.AsyncMock(side_effect=[
+            (504, {}, None),
+            (200, {}, {"code": 0, "data": {"onLessonClassrooms": [recovered_room]}}),
+        ])
+
+        with mock.patch.object(client, "_req", request), \
+                mock.patch.object(core.asyncio, "sleep", new=mock.AsyncMock()) as sleep:
+            rooms = await client.get_on_lesson()
+
+        self.assertEqual(rooms, [recovered_room])
+        self.assertEqual(request.await_args_list, [
+            mock.call("GET", "/api/v3/classroom/on-lesson-upcoming-exam"),
+            mock.call("GET", "/api/v3/classroom/on-lesson-upcoming-exam"),
+        ])
+        sleep.assert_awaited_once_with(1)
+
+    async def test_get_on_lesson_does_not_retry_transport_failure(self):
+        client = core.YuketangClient({"server": "yuketang"}, object())
+        request = mock.AsyncMock(side_effect=aiohttp.ClientConnectionError("offline"))
+
+        with mock.patch.object(client, "_req", request), \
+                mock.patch.object(core.asyncio, "sleep", new=mock.AsyncMock()) as sleep:
+            with self.assertRaisesRegex(RuntimeError, "ClientConnectionError"):
                 await client.get_on_lesson()
 
         request.assert_awaited_once_with(
             "GET", "/api/v3/classroom/on-lesson-upcoming-exam"
         )
+        sleep.assert_not_awaited()
 
     async def test_get_on_lesson_reports_explicit_authorization_loss(self):
         client = core.YuketangClient({"server": "yuketang"}, object())
@@ -1238,16 +1275,22 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
                 await client.get_on_lesson()
 
         self.assertTrue(client.lesson_discovery["latest"]["auth_expired"])
+        request.assert_awaited_once_with(
+            "GET", "/api/v3/classroom/on-lesson-upcoming-exam"
+        )
 
     async def test_get_on_lesson_rejects_missing_classroom_list(self):
         client = core.YuketangClient({"server": "yuketang"}, object())
-        request = mock.AsyncMock(return_value=(200, {}, {
-            "code": 0, "data": {"upcomingExam": []},
-        }))
+        request = mock.AsyncMock(return_value=(
+            200, {}, {"code": 0, "data": {"upcomingExam": []}},
+        ))
 
         with mock.patch.object(client, "_req", request):
             with self.assertRaisesRegex(RuntimeError, r"HTTP 200, code=0"):
                 await client.get_on_lesson()
+        request.assert_awaited_once_with(
+            "GET", "/api/v3/classroom/on-lesson-upcoming-exam"
+        )
 
     async def test_get_on_lesson_deduplicates_lesson_ids(self):
         client = core.YuketangClient({"server": "yuketang"}, object())
@@ -2064,6 +2107,36 @@ class WatcherTests(unittest.IsolatedAsyncioTestCase):
         await self.watcher.stop()
         self.root_patch.stop()
         self.temp_directory.cleanup()
+
+    def test_monitor_retry_delay_is_bounded_exponential(self):
+        self.assertEqual(
+            [server.Watcher._monitor_retry_delay(value) for value in (1, 2, 3, 4, 5, 6, 99)],
+            [5.0, 10.0, 20.0, 40.0, 60.0, 60.0, 60.0],
+        )
+
+    async def test_monitor_loop_applies_backoff_and_resets_after_success(self):
+        delays = []
+        self.watcher.cfg["lesson"]["poll_interval"] = 3
+
+        async def stop_after_delay(delay):
+            delays.append(delay)
+            self.watcher.running = False
+
+        self.client.get_on_lesson = mock.AsyncMock(side_effect=RuntimeError("gateway"))
+        with mock.patch.object(server.asyncio, "sleep", new=stop_after_delay):
+            for _ in range(5):
+                self.watcher.running = True
+                await self.watcher._run()
+
+            self.assertEqual(delays, [5.0, 10.0, 20.0, 40.0, 60.0])
+            self.assertEqual(self.watcher._monitor_failures, 5)
+            self.client.get_on_lesson = mock.AsyncMock(return_value=[])
+            self.watcher.running = True
+            await self.watcher._run()
+
+        self.assertEqual(delays[-1], 3.0)
+        self.assertEqual(self.watcher._monitor_failures, 0)
+        self.assertFalse(self.watcher.running)
 
     async def test_authorization_loss_schedules_account_email_notification(self):
         notifier = FakeNotifier()

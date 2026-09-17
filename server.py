@@ -578,6 +578,11 @@ class Watcher:
         self.hub.log("监课已启动（等待 App 手动签到或面板扫码签到）")
         return True
 
+    @staticmethod
+    def _monitor_retry_delay(failures: int) -> float:
+        exponent = min(max(int(failures) - 1, 0), 4)
+        return min(60.0, 5.0 * (2 ** exponent))
+
     async def stop(self):
         was_running = self.running
         self.running = False
@@ -672,16 +677,18 @@ class Watcher:
             if self.running:
                 if isinstance(exc, core.AuthenticationExpired):
                     self._notify_issue("authorization", "雨课堂账号授权已失效", str(exc))
+                    retry_delay = 30.0
                 else:
                     self._monitor_failures += 1
+                    retry_delay = self._monitor_retry_delay(self._monitor_failures)
                     if self._monitor_failures >= 3:
                         self._notify_issue(
                             "monitor", "雨课堂监课连续异常",
                             f"监课已连续失败 {self._monitor_failures} 次: {exc}",
                         )
                 self.hub.log(f"监课循环异常: {exc}", "error")
-                self.set_state("error", f"监课异常，5s 后重试: {exc}")
-                await asyncio.sleep(5)
+                self.set_state("error", f"监课异常，{retry_delay:g}s 后重试: {exc}")
+                await asyncio.sleep(retry_delay)
                 if self.running:
                     self.task = asyncio.create_task(
                         self._run(), name=f"watcher-restart-{self.account_id}"
