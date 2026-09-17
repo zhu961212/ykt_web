@@ -114,7 +114,6 @@ def public_scanner_config(request=None, config=None) -> dict:
 
 
 ADMIN_USERNAME_CHARS = frozenset(string.ascii_letters + string.digits + "-._@")
-ADMIN_PASSWORD_CHARS = frozenset(string.ascii_letters + string.digits + "-._~")
 ADMIN_PASSWORD_ITERATIONS = 310_000
 SCANNER_PASSWORD_ITERATIONS = 210_000
 
@@ -131,15 +130,18 @@ def _validate_admin_password(value, *, allow_empty=False):
         raise ValueError("管理员密码必须是字符串")
     if allow_empty and not value:
         return value
-    if not 12 <= len(value) <= 256 or any(char not in ADMIN_PASSWORD_CHARS for char in value):
-        raise ValueError("管理员密码必须为 12-256 位，只能使用字母、数字及 - . _ ~")
+    if not 12 <= len(value) <= 256:
+        raise ValueError("管理员密码必须为 12-256 位")
+    if any(not char.isprintable() for char in value):
+        raise ValueError("管理员密码不能包含换行、制表符或其他控制字符")
     return value
 
 
 def _validate_scanner_password(value):
-    if (not isinstance(value, str) or not 8 <= len(value) <= 128
-            or any(char not in ADMIN_PASSWORD_CHARS for char in value)):
-        raise ValueError("扫码页密码必须为 8-128 位，只能使用字母、数字及 - . _ ~")
+    if not isinstance(value, str) or not 4 <= len(value) <= 128:
+        raise ValueError("扫码页密码必须为 4-128 位")
+    if any(not char.isprintable() for char in value):
+        raise ValueError("扫码页密码不能包含换行、制表符或其他控制字符")
     return value
 
 

@@ -1454,6 +1454,19 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AdminAuthTests(unittest.IsolatedAsyncioTestCase):
+    def test_password_validators_accept_printable_symbols_and_unicode(self):
+        admin_password = "管理密码 !@#$%^&* 2026"
+        scanner_password = "扫! 1"
+
+        self.assertEqual(server._validate_admin_password(admin_password), admin_password)
+        self.assertEqual(server._validate_scanner_password(scanner_password), scanner_password)
+        with self.assertRaisesRegex(ValueError, "控制字符"):
+            server._validate_admin_password("invalid-password\n")
+        with self.assertRaisesRegex(ValueError, "控制字符"):
+            server._validate_scanner_password("invalid\tpassword")
+        with self.assertRaisesRegex(ValueError, "4-128"):
+            server._validate_scanner_password("123")
+
     def test_remote_listener_requires_strong_admin_password(self):
         with self.assertRaisesRegex(RuntimeError, "至少 12 位"):
             server.server_runtime_config({"YKT_HOST": "0.0.0.0"})
@@ -2668,10 +2681,12 @@ class PersistenceAndFrontendTests(unittest.TestCase):
         self.assertIn('classList.toggle("settings-mode"', html)
         self.assertIn('id="adminForm"', html)
         self.assertIn('id="adminNewPassword" type="password"', html)
+        self.assertNotIn('pattern="[A-Za-z0-9', html)
         self.assertNotIn('id="adminCurrentPassword"', html)
         self.assertNotIn('id="adminUsername"', html)
         self.assertIn('requestJSON("/api/admin/credentials"', html)
         self.assertIn('id="scannerForm"', html)
+        self.assertIn('id="scannerPassword" type="password" minlength="4"', html)
         self.assertIn('requestJSON("/api/scanner/credentials"', html)
 
     def test_frontend_scan_all_automatically_submits_detected_code(self):

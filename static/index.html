@@ -144,8 +144,8 @@
       <h2>管理员密码</h2>
       <form id="adminForm" autocomplete="off">
         <div class="admin-form-grid">
-          <label class="field"><span>新密码</span><input id="adminNewPassword" type="password" minlength="12" maxlength="256" pattern="[A-Za-z0-9._~\-]{12,256}" autocomplete="new-password" required></label>
-          <label class="field"><span>确认新密码</span><input id="adminConfirmPassword" type="password" minlength="12" maxlength="256" pattern="[A-Za-z0-9._~\-]{12,256}" autocomplete="new-password" required></label>
+          <label class="field"><span>新密码</span><input id="adminNewPassword" type="password" minlength="12" maxlength="256" autocomplete="new-password" required></label>
+          <label class="field"><span>确认新密码</span><input id="adminConfirmPassword" type="password" minlength="12" maxlength="256" autocomplete="new-password" required></label>
         </div>
         <button id="btnSaveAdmin" class="primary" type="submit" style="width:100%;margin-top:10px">更新管理员密码</button>
         <div id="adminHint" class="hint form-message"></div>
@@ -157,8 +157,8 @@
       <form id="scannerForm" autocomplete="off">
         <label class="field"><span>页面地址</span><input id="scannerUrl" type="text" readonly></label>
         <div class="admin-form-grid">
-          <label class="field"><span>扫码页密码</span><input id="scannerPassword" type="password" minlength="8" maxlength="128" pattern="[A-Za-z0-9._~\-]{8,128}" autocomplete="new-password" required></label>
-          <label class="field"><span>确认扫码页密码</span><input id="scannerPasswordConfirm" type="password" minlength="8" maxlength="128" pattern="[A-Za-z0-9._~\-]{8,128}" autocomplete="new-password" required></label>
+          <label class="field"><span>扫码页密码</span><input id="scannerPassword" type="password" minlength="4" maxlength="128" autocomplete="new-password" required></label>
+          <label class="field"><span>确认扫码页密码</span><input id="scannerPasswordConfirm" type="password" minlength="4" maxlength="128" autocomplete="new-password" required></label>
         </div>
         <div class="row" style="margin-top:10px">
           <button id="btnSaveScanner" class="primary" type="submit" style="flex:1">保存扫码页密码</button>
