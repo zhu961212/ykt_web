@@ -7,7 +7,8 @@
     "vision_enabled": false
   },
   "lesson": {
-    "poll_interval": 3
+    "poll_interval": 3,
+    "enter_delay_seconds": 5
   },
   "email": {
     "enabled": false,

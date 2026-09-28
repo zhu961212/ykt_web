@@ -27,7 +27,7 @@ def config(*, dry_run=True):
             "temperature": 0.1,
             "vision_enabled": False,
         },
-        "lesson": {"poll_interval": 0.01},
+        "lesson": {"poll_interval": 0.01, "enter_delay_seconds": 0},
         "email": {
             "enabled": False,
             "smtp_host": "",
@@ -1986,6 +1986,120 @@ class WatcherTests(unittest.IsolatedAsyncioTestCase):
             [server.Watcher._monitor_retry_delay(value) for value in (1, 2, 3, 4, 5, 6, 99)],
             [5.0, 10.0, 20.0, 40.0, 60.0, 60.0, 60.0],
         )
+
+    async def test_new_lesson_waits_before_checkin_and_classroom_entry(self):
+        self.watcher.cfg["lesson"]["enter_delay_seconds"] = 5
+        self.client.get_on_lesson = mock.AsyncMock(return_value=[
+            {"lessonId": "lesson-1", "courseName": "Course"},
+        ])
+        events = []
+        original_checkin = self.client.checkin
+
+        async def wait_before_entry(delay):
+            self.assertEqual(self.hub.state["phase"], "waiting_entry")
+            self.assertEqual(self.watcher.lesson_id, "lesson-1")
+            self.assertEqual(self.client.checkin_calls, [])
+            events.append(("delay", delay))
+
+        async def checkin(lesson_id, join_if_not_in=False):
+            events.append(("checkin", lesson_id))
+            return await original_checkin(lesson_id, join_if_not_in)
+
+        async def enter_class(lesson_id, course_name):
+            events.append(("entry", lesson_id, course_name))
+            self.watcher.running = False
+            return "finished"
+
+        self.client.checkin = checkin
+        self.watcher._in_class = mock.AsyncMock(side_effect=enter_class)
+        self.watcher.running = True
+        with mock.patch.object(server.asyncio, "sleep", new=wait_before_entry):
+            await self.watcher._run()
+
+        self.assertEqual(events, [
+            ("delay", 5),
+            ("checkin", "lesson-1"),
+            ("entry", "lesson-1", "Course"),
+        ])
+        self.assertEqual(self.client.checkin_calls, [("lesson-1", False)])
+
+    async def test_zero_entry_delay_checks_in_without_sleeping(self):
+        self.client.get_on_lesson = mock.AsyncMock(return_value=[
+            {"lessonId": "lesson-1", "courseName": "Course"},
+        ])
+
+        async def enter_class(lesson_id, course_name):
+            self.watcher.running = False
+            return "finished"
+
+        self.watcher._in_class = mock.AsyncMock(side_effect=enter_class)
+        self.watcher.running = True
+        with mock.patch.object(server.asyncio, "sleep", new_callable=mock.AsyncMock) as sleep:
+            await self.watcher._run()
+
+        sleep.assert_not_awaited()
+        self.assertEqual(self.client.checkin_calls, [("lesson-1", False)])
+        self.watcher._in_class.assert_awaited_once_with("lesson-1", "Course")
+
+    async def test_stop_cancels_entry_delay_before_checkin(self):
+        self.watcher.cfg["lesson"]["enter_delay_seconds"] = 5
+        self.client.get_on_lesson = mock.AsyncMock(return_value=[
+            {"lessonId": "lesson-1", "courseName": "Course"},
+        ])
+        waiting = asyncio.Event()
+        release = asyncio.Event()
+
+        async def wait_before_entry(delay):
+            self.assertEqual(delay, 5)
+            waiting.set()
+            await release.wait()
+
+        self.watcher._in_class = mock.AsyncMock()
+        with mock.patch.object(server.asyncio, "sleep", new=wait_before_entry):
+            self.assertTrue(self.watcher.start())
+            task = self.watcher.task
+            await asyncio.wait_for(waiting.wait(), timeout=1)
+            self.assertEqual(self.hub.state["phase"], "waiting_entry")
+            await self.watcher.stop()
+
+        self.assertTrue(task.cancelled())
+        self.assertFalse(self.watcher.running)
+        self.assertEqual(self.client.checkin_calls, [])
+        self.watcher._in_class.assert_not_awaited()
+        self.assertEqual(self.hub.state["phase"], "idle")
+
+    async def test_entry_delay_rejects_changed_lesson_or_generation(self):
+        for changed_field in ("lesson_id", "_lesson_generation"):
+            with self.subTest(changed_field=changed_field):
+                self.watcher.cfg["lesson"]["enter_delay_seconds"] = 5
+                self.client.get_on_lesson = mock.AsyncMock(side_effect=[
+                    [{"lessonId": "lesson-1", "courseName": "Course"}],
+                    [],
+                ])
+                delays = []
+
+                async def change_lesson_during_delay(delay):
+                    delays.append(delay)
+                    if len(delays) == 1:
+                        self.assertEqual(self.hub.state["phase"], "waiting_entry")
+                        if changed_field == "lesson_id":
+                            self.watcher.lesson_id = "lesson-2"
+                        else:
+                            self.watcher._lesson_generation += 1
+                    else:
+                        self.watcher.running = False
+
+                self.watcher._wait_manual_join = mock.AsyncMock(return_value=True)
+                self.watcher._in_class = mock.AsyncMock()
+                self.watcher.running = True
+                with mock.patch.object(server.asyncio, "sleep", new=change_lesson_during_delay):
+                    await self.watcher._run()
+
+                self.assertEqual(delays, [5, 1])
+                self.watcher._wait_manual_join.assert_not_awaited()
+                self.watcher._in_class.assert_not_awaited()
+                self.assertEqual(self.client.checkin_calls, [])
+                await self.watcher.stop()
 
     async def test_monitor_loop_applies_backoff_and_resets_after_success(self):
         delays = []

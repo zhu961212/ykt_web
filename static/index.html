@@ -417,7 +417,7 @@ function applyState(state) {
   if (!qrController) $("qrHint").textContent = active.length ? "可继续添加账号" : "尚未登录";
 }
 
-const phaseNames = {idle:"已停止", waiting:"等待课程", waiting_checkin:"等待签到", in_class:"课堂中", reconnecting:"正在重连", error:"异常", expired:"登录失效"};
+const phaseNames = {idle:"已停止", waiting:"等待课程", waiting_entry:"等待进入", waiting_checkin:"等待签到", in_class:"课堂中", reconnecting:"正在重连", error:"异常", expired:"登录失效"};
 
 function actionButton(label, action, style) {
   const button = document.createElement("button");

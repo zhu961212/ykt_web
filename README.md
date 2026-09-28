@@ -73,6 +73,8 @@ cp config.example.json config.json
 
 ### Linux 服务器部署
 
+Debian 12（含 12.1）可按 [Debian 12 部署指南](docs/DEPLOY_DEBIAN12.md) 操作，包含 HTTPS、SSH 隧道、首次配置和后续更新步骤。
+
 有公网域名时，推荐让部署脚本同时配置 Caddy 和 HTTPS。开始前先完成以下准备：
 
 - 将域名的 `A` 记录指向服务器公网 IPv4；只有服务器确实可通过 IPv6 访问时才保留 `AAAA` 记录
@@ -210,6 +212,7 @@ SMTP 授权码只写入本机 `config.json`，接口与网页不会回显。修�
 | `llm.model` | 用于解题的模型 ID |
 | `llm.vision_enabled` | 是否已确认模型支持图片输入，默认关闭 |
 | `lesson.poll_interval` | 课程和手动签到状态的轮询间隔 |
+| `lesson.enter_delay_seconds` | 发现新课堂后等待多久再检测签到并连接课堂，默认 5 秒；设为 0 可立即检测，仍需先在 App 手动签到 |
 | `email.enabled` | 是否发送账号与监课异常邮件 |
 | `email.smtp_host` / `email.smtp_port` | SMTP 服务器地址与端口 |
 | `email.security` | `ssl` 或 `starttls` |

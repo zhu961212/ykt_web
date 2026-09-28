@@ -40,7 +40,7 @@ DEFAULTS = {
         "temperature": 0.1,
         "vision_enabled": False,
     },
-    "lesson": {"poll_interval": 3},
+    "lesson": {"poll_interval": 3, "enter_delay_seconds": 5},
     "email": dict(emailer.DEFAULT_EMAIL_SETTINGS),
     "bot": {
         "dry_run": True,
@@ -633,6 +633,20 @@ class Watcher:
                     self._lesson_generation += 1
                     self.lesson_id, self.course_name = lid, cname
                     self.hub.log(f"发现在上课课程: lessonId={lid} {cname}")
+                    enter_delay = max(0.0, float(
+                        self.cfg.get("lesson", {}).get("enter_delay_seconds", 5)
+                    ))
+                    if enter_delay > 0:
+                        generation = self._lesson_generation
+                        detail = f"已发现 {cname}，{enter_delay:g}s 后检测签到并连接课堂"
+                        self.set_state("waiting_entry", detail,
+                                       lesson_id=lid, course_name=cname)
+                        self.hub.log(detail)
+                        await asyncio.sleep(enter_delay)
+                        if not self.running:
+                            break
+                        if self.lesson_id != lid or self._lesson_generation != generation:
+                            continue
                 self.set_state("waiting_checkin", f"已发现 {cname}，等待你在 App 手动签到",
                                lesson_id=lid, course_name=cname)
                 if not await self._wait_manual_join(lid, cname):
