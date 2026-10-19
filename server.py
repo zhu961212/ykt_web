@@ -38,7 +38,8 @@ DEFAULTS = {
         "api_key": "",
         "model": "glm-4-flash",
         "temperature": 0.1,
-        "vision_enabled": False,
+        "vision_enabled": True,
+        "reasoning_effort": "",
     },
     "lesson": {"poll_interval": 3, "enter_delay_seconds": 5},
     "email": dict(emailer.DEFAULT_EMAIL_SETTINGS),
@@ -47,7 +48,6 @@ DEFAULTS = {
         "wait_manual_checkin": True,
         "auto_start_watching": False,
         "answer_delay_seconds": 5,
-        "safety_seconds": 8,
         "request_margin_seconds": 1.5,
     },
 }
@@ -76,6 +76,9 @@ def load_config() -> dict:
         DEFAULTS["email"], loaded.get("email", {}),
     )
     merged["bot"] = {**DEFAULTS["bot"], **loaded.get("bot", {})}
+    # Old installations reserved another eight seconds. Only the submission
+    # request margin now limits solving, even when an old config keeps this key.
+    merged["bot"].pop("safety_seconds", None)
     if merged.get("server") not in core.SERVERS:
         merged["server"] = "changjiang"
     # Background watching only observes accounts that have already joined a lesson.
@@ -92,7 +95,8 @@ def public_llm_config(config=None) -> dict:
     return {
         "base_url": str(settings.get("base_url") or ""),
         "model": str(settings.get("model") or ""),
-        "vision_enabled": bool(settings.get("vision_enabled", False)),
+        "vision_enabled": bool(settings.get("vision_enabled", True)),
+        "reasoning_effort": str(settings.get("reasoning_effort") or ""),
         "api_key_configured": core.api_key_configured(settings.get("api_key", "")),
     }
 
@@ -337,16 +341,197 @@ def save_account_records(records: dict, path=None):
 class Hub:
     """把日志/状态/题目事件推给所有连着的浏览器 (WS /ws)"""
 
-    def __init__(self):
+    LOG_LIMIT = 1000
+    LOG_MAX_BYTES = 4 * 1024 * 1024
+    LOG_TEXT_LIMIT = 8192
+
+    def __init__(self, log_path=None):
         self.clients = set()
         self.history = deque(maxlen=400)
+        # Status/timing events must never evict the logs used for browser replay.
+        self.log_history = deque()
+        self.log_path = Path(log_path) if log_path is not None else ROOT / "logs" / "panel.jsonl"
+        self._log_history_bytes = 0
+        self._log_file_bytes = 0
+        self._log_file_records = 0
+        self._log_lock = asyncio.Lock()
+        self._log_tasks = set()
+        self._log_storage_warning = False
+        self._log_needs_compact = False
+        self._restore_logs()
         self.current_problem = None
         self.state = {"phase": "idle", "user_id": "", "user_name": "", "lesson_id": "",
                       "course_name": "", "answered": 0, "problems": 0, "dry_run": True,
                       "session_saved": SESSION_PATH.exists(), "detail": "未启动"}
 
+    @classmethod
+    def _log_message(cls, payload):
+        """Persist only the displayed log fields, never arbitrary event payloads."""
+        if not isinstance(payload, dict) or payload.get("kind") != "log":
+            return None
+        timestamp = payload.get("ts")
+        if (not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool)
+                or not 0 <= timestamp < float("inf")
+                or not isinstance(payload.get("text"), str)):
+            return None
+        text = payload["text"]
+        if len(text) > cls.LOG_TEXT_LIMIT:
+            text = text[:cls.LOG_TEXT_LIMIT] + "（日志过长，已截断）"
+        value = {
+            "kind": "log", "ts": timestamp, "text": text,
+            "level": str(payload.get("level") or "info")[:32],
+        }
+        for key in ("account_id", "account_name"):
+            if isinstance(payload.get(key), str):
+                value[key] = payload[key][:512]
+        log_id = payload.get("log_id")
+        if not isinstance(log_id, str) or not log_id or len(log_id) > 128:
+            log_id = hashlib.sha256(json.dumps(value, ensure_ascii=False).encode("utf-8")).hexdigest()
+        value["log_id"] = log_id
+        return json.dumps(value, ensure_ascii=False)
+
+    def _retain_log(self, message):
+        self.log_history.append(message)
+        self._log_history_bytes += len(message.encode("utf-8")) + 1
+        while (len(self.log_history) > self.LOG_LIMIT
+               or self._log_history_bytes > self.LOG_MAX_BYTES):
+            removed = self.log_history.popleft()
+            self._log_history_bytes -= len(removed.encode("utf-8")) + 1
+
+    def _log_storage_error(self, exc):
+        self._log_needs_compact = True
+        if not self._log_storage_warning:
+            self._log_storage_warning = True
+            try:
+                print("历史日志读写失败，当前日志仍保留在内存: " + type(exc).__name__, flush=True)
+            except OSError:
+                pass
+
+    def _replace_log_file(self, messages):
+        self.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temp = self.log_path.with_name(
+            f".{self.log_path.name}.{os.getpid()}.{time.time_ns()}.tmp",
+        )
+        try:
+            descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                os.chmod(temp, 0o600)
+                handle.writelines(message + "\n" for message in messages)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, self.log_path)
+            os.chmod(self.log_path, 0o600)
+            self._log_file_bytes = sum(len(message.encode("utf-8")) + 1 for message in messages)
+            self._log_file_records = len(messages)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def _restore_logs(self):
+        try:
+            with self.log_path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                file_size = handle.tell()
+                start = max(0, file_size - self.LOG_MAX_BYTES)
+                handle.seek(start)
+                if start:
+                    handle.readline()  # Skip the partial first record of a bounded tail read.
+                records = 0
+                compact = bool(start)
+                for raw in handle:
+                    records += 1
+                    try:
+                        message = self._log_message(json.loads(raw))
+                    except (ValueError, TypeError, UnicodeError):
+                        message = None
+                    if message is None:
+                        compact = True
+                        continue
+                    self._retain_log(message)
+                    compact = compact or raw != (message + "\n").encode("utf-8")
+            self._log_file_bytes = file_size
+            self._log_file_records = records
+            if compact or records != len(self.log_history):
+                self._replace_log_file(list(self.log_history))
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            self._log_storage_error(exc)
+
+    def _append_log_file(self, message, messages):
+        size = len(message.encode("utf-8")) + 1
+        if (self._log_needs_compact or self._log_file_records >= self.LOG_LIMIT
+                or self._log_file_bytes + size > self.LOG_MAX_BYTES):
+            self._replace_log_file(messages)
+            return
+        self.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(self.log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            os.chmod(self.log_path, 0o600)
+            handle.write(message + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        self._log_file_bytes += size
+        self._log_file_records += 1
+
+    async def _remember_log(self, payload):
+        message = self._log_message(payload)
+        if message is None:
+            return
+        # Serialize log writes while letting monitoring and status events continue.
+        async with self._log_lock:
+            self._retain_log(message)
+            cancelled = False
+            try:
+                write = asyncio.get_running_loop().run_in_executor(
+                    None, self._append_log_file, message, list(self.log_history),
+                )
+                while True:
+                    try:
+                        await asyncio.shield(write)
+                        break
+                    except asyncio.CancelledError:
+                        # A running thread cannot be cancelled. Keep the lock until
+                        # it finishes so its replace cannot overwrite a later log.
+                        cancelled = True
+                self._log_storage_warning = False
+                self._log_needs_compact = False
+            except Exception as exc:
+                self._log_storage_error(exc)
+            if cancelled:
+                raise asyncio.CancelledError
+
+    def _log_task_done(self, task):
+        self._log_tasks.discard(task)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                self._log_storage_error(error)
+
+    def _schedule_log(self, coroutine):
+        task = asyncio.ensure_future(coroutine)
+        self._log_tasks.add(task)
+        task.add_done_callback(self._log_task_done)
+
+    async def drain_logs(self):
+        cancelled = False
+        while self._log_tasks:
+            tasks = tuple(self._log_tasks)
+            pending = asyncio.gather(*tasks, return_exceptions=True)
+            while True:
+                try:
+                    await asyncio.shield(pending)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+            self._log_tasks.difference_update(tasks)
+        if cancelled:
+            raise asyncio.CancelledError
+
     async def push(self, kind: str, **data):
         payload = {"kind": kind, "ts": time.time(), **data}
+        if kind == "log":
+            payload["log_id"] = secrets.token_hex(12)
+            await self._remember_log(payload)
         if kind == "problem":
             if (not self.current_problem or data.get("status") == "solving" or
                     self.current_problem.get("problem_id") != data.get("problem_id")):
@@ -367,6 +552,9 @@ class Hub:
 
     async def push_account(self, account_id: str, kind: str, **data):
         payload = {"kind": kind, "ts": time.time(), "account_id": account_id, **data}
+        if kind == "log":
+            payload["log_id"] = secrets.token_hex(12)
+            await self._remember_log(payload)
         msg = json.dumps(payload, ensure_ascii=False)
         self.history.append(msg)
         for ws in list(self.clients):
@@ -377,12 +565,12 @@ class Hub:
 
     def log(self, text: str, level: str = "info"):
         print(time.strftime("[%H:%M:%S] ") + text, flush=True)
-        asyncio.ensure_future(self.push("log", text=text, level=level))
+        self._schedule_log(self.push("log", text=text, level=level))
 
     def log_account(self, account_id: str, account_name: str, text: str, level: str = "info"):
         label = account_name or account_id
         print(time.strftime("[%H:%M:%S] ") + f"[{label}] {text}", flush=True)
-        asyncio.ensure_future(self.push_account(
+        self._schedule_log(self.push_account(
             account_id, "log", text=text, level=level, account_name=account_name,
         ))
 
@@ -442,12 +630,20 @@ class SharedAnswerPool:
     def __init__(self, max_completed: int = 512):
         self.max_completed = max(1, int(max_completed))
         self._completed = OrderedDict()
+        self._completed_at = {}
         self._inflight = {}
         self._lock = asyncio.Lock()
 
     @staticmethod
-    def _key(server_key, lesson_id, problem_id):
-        return str(server_key), str(lesson_id), str(problem_id)
+    def _key(server_key, lesson_id, problem_id, problem):
+        # A teacher can revise a question without changing its ID. Ordered
+        # options and image content must be part of the shared answer identity.
+        solver_content = {name: value for name, value in problem.items()
+                          if name not in ("raw", "dt", "problem_id")}
+        content = json.dumps(solver_content, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"))
+        revision = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return str(server_key), str(lesson_id), str(problem_id), revision
 
     @staticmethod
     def _observe_task(task: asyncio.Task):
@@ -462,25 +658,39 @@ class SharedAnswerPool:
     async def _run(self, key, problem: dict, solver):
         try:
             result = await solver.solve(problem)
+            finished_at = time.time()
         except asyncio.CancelledError:
             await self._remove_inflight(key, asyncio.current_task())
             raise
         except Exception:
-            await self._remove_inflight(key, asyncio.current_task())
+            async with self._lock:
+                if self._inflight.get(key) is asyncio.current_task():
+                    self._inflight.pop(key, None)
+                pinned = self._completed.get(key)
+                if pinned is not None and pinned.get("source") == "random_timeout":
+                    return copy.deepcopy(pinned)
             raise
 
         async with self._lock:
             if self._inflight.get(key) is asyncio.current_task():
                 self._inflight.pop(key, None)
                 if result is not None:
+                    pinned = self._completed.get(key)
+                    if pinned is not None and pinned.get("source") == "random_timeout":
+                        # All accounts keep the same timeout choice, even if the
+                        # original shared model request finishes afterwards.
+                        return copy.deepcopy(pinned)
                     self._completed[key] = copy.deepcopy(result)
+                    self._completed_at[key] = finished_at
                     self._completed.move_to_end(key)
                     while len(self._completed) > self.max_completed:
-                        self._completed.popitem(last=False)
+                        removed, _ = self._completed.popitem(last=False)
+                        self._completed_at.pop(removed, None)
         return result
 
     async def solve(self, server_key, lesson_id, problem_id, problem: dict, solver):
-        key = self._key(server_key, lesson_id, problem_id)
+        problem = copy.deepcopy(problem)
+        key = self._key(server_key, lesson_id, problem_id, problem)
         async with self._lock:
             cached = self._completed.get(key)
             if cached is not None:
@@ -496,15 +706,47 @@ class SharedAnswerPool:
                 self._inflight[key] = task
         return copy.deepcopy(await asyncio.shield(task))
 
+    async def random_fallback(self, server_key, lesson_id, problem_id, problem: dict,
+                              *, model_deadline=None):
+        problem = copy.deepcopy(problem)
+        key = self._key(server_key, lesson_id, problem_id, problem)
+        async with self._lock:
+            cached = self._completed.get(key)
+            if cached is not None and cached.get("source") == "random_timeout":
+                self._completed.move_to_end(key)
+                return copy.deepcopy(cached)
+            if cached is not None and (model_deadline is None
+                    or self._completed_at.get(key, float("inf")) < model_deadline):
+                # A delayed account should use an answer that was already ready
+                # before its model cutoff, rather than replacing it randomly.
+                self._completed.move_to_end(key)
+                return copy.deepcopy(cached)
+            result = core.random_choice_result(problem)
+            if result is None:
+                return None
+            result["source"] = "random_timeout"
+            self._completed[key] = copy.deepcopy(result)
+            self._completed_at[key] = time.time()
+            self._completed.move_to_end(key)
+            while len(self._completed) > self.max_completed:
+                removed, _ = self._completed.popitem(last=False)
+                self._completed_at.pop(removed, None)
+            return copy.deepcopy(result)
+
     async def clear(self):
         async with self._lock:
             tasks = list(self._inflight.values())
             self._inflight.clear()
             self._completed.clear()
+            self._completed_at.clear()
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class _QuestionWindowExpired(asyncio.TimeoutError):
+    """The question's model waiting budget, rather than the API, expired."""
 
 
 class Watcher:
@@ -525,6 +767,8 @@ class Watcher:
         self.task = None
         self.problems = {}
         self.answered = set()
+        self.submission_attempts = set()
+        self.uncertain_submissions = set()
         self.answer_tasks = {}
         self.background_tasks = set()
         self.question_windows = {}
@@ -601,6 +845,8 @@ class Watcher:
     def _clear_class(self):
         self.problems.clear()
         self.answered.clear()
+        self.submission_attempts.clear()
+        self.uncertain_submissions.clear()
         self.current_pres = None
         self.active_pres_id = None
         self._presentation_cache.clear()
@@ -1024,32 +1270,45 @@ class Watcher:
         except (TypeError, ValueError):
             limit = 30.0
         start = received_at
+        server_dt_valid = False
         try:
             raw = float(dt_value)
             candidate = raw / 1000.0 if raw > 10_000_000_000 else raw
             if abs(candidate - received_at) <= 86_400:
                 start = candidate
+                server_dt_valid = True
         except (TypeError, ValueError):
             pass
-        configured_safety = max(0.5, float(self.cfg["bot"].get("safety_seconds", 8)))
-        safety = min(configured_safety, max(0.5, limit * 0.25))
+        request_margin = max(0.5, float(self.cfg["bot"].get("request_margin_seconds", 1.5)))
         closes_at = start + limit
-        submit_by = closes_at - safety
+        submit_by = closes_at - request_margin
         return {"start": start, "dt_ms": int(start * 1000), "limit": limit,
-                "safety": safety, "closes_at": closes_at, "submit_by": submit_by,
+                "request_margin": request_margin, "closes_at": closes_at, "submit_by": submit_by,
+                "server_dt_valid": server_dt_valid,
                 "lesson_id": self.lesson_id}
 
     def _schedule_problem(self, problem_event: dict, presentation_id=None):
         problem_id = str(problem_event.get("prob") or problem_event.get("problemId") or "").strip()
-        if not problem_id or problem_id in self.answered or problem_id in self.answer_tasks:
+        if (not problem_id or problem_id in self.answered or problem_id in self.answer_tasks
+                or problem_id in self.uncertain_submissions):
             return
         window = self._question_window(problem_event.get("dt"), problem_event.get("limit"), time.time())
-        if window["submit_by"] <= time.time():
+        previous = self.question_windows.get(problem_id)
+        if (not window["server_dt_valid"] and previous
+                and previous.get("lesson_id") == self.lesson_id):
+            # An event without a usable server timestamp is not evidence of a
+            # new round. Replays must not reset its deadline or bypass dedup.
+            window = previous
+        if (problem_id, window["dt_ms"]) in self.submission_attempts:
+            return
+        if window["closes_at"] <= time.time():
+            self.hub.log(f"收到题目 {problem_id} 时已过真实截止，未提交", "warn")
             return
         window["presentation_id"] = self._presentation_id(presentation_id) or self.active_pres_id
         self.question_windows[problem_id] = window
         self.current_problem_id = problem_id
-        self.hub.log(f"收到题目 {problem_id}，限时 {window['limit']:g}s，计划至少提前 {window['safety']:g}s 提交")
+        self.hub.log(f"收到题目 {problem_id}，限时 {window['limit']:g}s，"
+                     f"仅为提交请求预留 {window['request_margin']:g}s")
         task = asyncio.create_task(
             self._answer_flow(problem_id), name=f"answer-{self.account_id}-{problem_id}"
         )
@@ -1074,22 +1333,47 @@ class Watcher:
             f"timing-{problem_id}",
         )
 
+    @staticmethod
+    async def _wait_for_question_window(awaitable, window: dict):
+        """Keep one operation alive when the teacher extends its deadline."""
+        task = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                deadline = window["submit_by"]
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise _QuestionWindowExpired()
+                done, _ = await asyncio.wait({task}, timeout=remaining)
+                if done:
+                    return task.result()
+                # Retry the wait only after a real extension. The operation itself
+                # must not restart, and an unchanged deadline must still time out.
+                if window["submit_by"] <= deadline:
+                    raise _QuestionWindowExpired()
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def _answer_flow(self, problem_id: str):
         try:
             window = self.question_windows[problem_id]
             if window["lesson_id"] != self.lesson_id:
                 return
+            attempt = (problem_id, window["dt_ms"])
+            if attempt in self.submission_attempts or problem_id in self.uncertain_submissions:
+                return
             problem = self.problems.get(problem_id)
             presentation_id = window.get("presentation_id") or self.current_pres
             if not problem and presentation_id is not None:
                 remaining = window["submit_by"] - time.time()
-                if remaining > 0.25:
+                if remaining > 0:
                     try:
-                        await asyncio.wait_for(
+                        await self._wait_for_question_window(
                             self._load_presentation(
                                 presentation_id, force=True, required_problem_id=problem_id,
                             ),
-                            timeout=max(0.1, remaining - 0.1),
+                            window,
                         )
                     except asyncio.TimeoutError:
                         pass
@@ -1114,46 +1398,95 @@ class Watcher:
 
             solved = None
             error = ""
-            request_margin = max(0.5, float(self.cfg["bot"].get("request_margin_seconds", 1.5)))
-            solve_budget = window["submit_by"] - time.time() - request_margin
+            question_timed_out = False
+            solve_started = time.monotonic()
+            initial_submit_by = window["submit_by"]
+            solve_budget = window["submit_by"] - time.time()
+            model = " ".join(str(self.cfg.get("llm", {}).get("model") or "未配置").split())[:120]
+            image_problem = bool(problem.get("images") or problem.get("image_items"))
+            self.hub.log(
+                f"题目 {problem_id} 开始解题：模型={model}，"
+                f"图片题={'是' if image_problem else '否'}，可用预算={max(0.0, solve_budget):.2f}s"
+            )
             if (problem.get("images")
-                    and not self.cfg.get("llm", {}).get("vision_enabled", False)):
+                    and not self.cfg.get("llm", {}).get("vision_enabled", True)):
                 error = "模型尚未确认支持图片输入"
-            elif solve_budget > 0.1:
+            elif solve_budget > 0:
                 try:
-                    solved = await asyncio.wait_for(
+                    solved = await self._wait_for_question_window(
                         self.answer_pool.solve(
                             self.client.server_key, window["lesson_id"], problem_id,
                             problem, self.solver,
                         ),
-                        timeout=solve_budget,
+                        window,
                     )
-                except asyncio.TimeoutError:
+                except _QuestionWindowExpired:
                     error = "LLM 超时"
+                    question_timed_out = True
+                except asyncio.TimeoutError:
+                    error = "LLM 请求超时"
+                    question_timed_out = time.time() >= window["submit_by"]
                 except Exception as exc:
                     error = str(exc)
             else:
                 error = "剩余时间不足"
+                question_timed_out = True
+            if (solved is not None and solved.get("source") != "random_timeout"
+                    and time.time() >= window["submit_by"]):
+                solved = None
+                error = "模型答案晚于等待截止"
+                question_timed_out = True
+            if (solved is None and question_timed_out and self.running
+                    and window["lesson_id"] == self.lesson_id
+                    and time.time() < window["closes_at"]):
+                try:
+                    solved = await self.answer_pool.random_fallback(
+                        self.client.server_key, window["lesson_id"], problem_id, problem,
+                        model_deadline=window["submit_by"],
+                    )
+                except (TypeError, ValueError) as exc:
+                    error = f"无法生成合法随机选项: {exc}"
+            random_timeout = solved is not None and solved.get("source") == "random_timeout"
+            elapsed = max(0.0, time.monotonic() - solve_started)
+            effective_budget = max(0.0, solve_budget + window["submit_by"] - initial_submit_by)
+            solve_timing = (
+                f"耗时={elapsed:.2f}s，有效预算={effective_budget:.2f}s，"
+                f"距模型等待截止={max(0.0, window['submit_by'] - time.time()):.2f}s"
+            )
             if solved is None:
                 error = error or "模型未返回有效答案"
-                self.hub.log(f"题目 {problem_id} 解题失败（{error}），为避免误答未提交", "error")
+                self.hub.log(
+                    f"题目 {problem_id} 解题失败（{error}），{solve_timing}，为避免误答未提交",
+                    "error",
+                )
                 await self.hub.push(
                     "problem", problem_id=problem_id, status="failed(solve)",
                     answer="未生成答案",
                 )
                 return
+            if random_timeout:
+                self.hub.log(f"[随机兜底] source=random_timeout 题目 {problem_id} 模型等待超时，"
+                             f"随机选择 {solved['display']}，{solve_timing}", "warn")
+                await self.hub.push("problem", problem_id=problem_id, status="ready(random)",
+                                    answer=solved["display"], source="random_timeout")
+            else:
+                self.hub.log(f"题目 {problem_id} 解题完成，{solve_timing}")
 
             answer_delay = max(0.0, float(self.cfg["bot"].get("answer_delay_seconds", 5)))
-            submit_at = min(window["start"] + answer_delay, window["submit_by"] - 0.1)
-            if time.time() < submit_at:
+            submit_at = window["start"] + answer_delay
+            # An advisory delay must not consume the only remaining request
+            # margin on a short question. Send immediately if it cannot fit.
+            if not random_timeout and time.time() < submit_at < window["submit_by"]:
                 await asyncio.sleep(submit_at - time.time())
             if not self.running or window["lesson_id"] != self.lesson_id:
                 return
-            remaining = window["submit_by"] - time.time()
-            if remaining <= 0.1:
-                self.hub.log(f"题目 {problem_id} 已错过安全提交窗口，未提交", "warn")
+            now = time.time()
+            remaining = window["closes_at"] - now
+            if remaining <= 0:
+                self.hub.log(f"题目 {problem_id} 已过真实截止，未提交", "warn")
                 await self.hub.push("problem", problem_id=problem_id, status="expired",
-                                    answer=solved["display"])
+                                    answer=solved["display"],
+                                    source="random_timeout" if random_timeout else "model")
                 return
 
             dry_run = self.cfg["bot"].get("dry_run", True)
@@ -1162,29 +1495,67 @@ class Watcher:
                 self.hub.log(f"[DRY] {problem_id} {type_name} => {solved['display']}")
             else:
                 try:
-                    response = await self.client.submit_answer(
-                        problem_id, window["dt_ms"], problem["type"], solved["result"],
-                        timeout=max(0.1, min(10.0, remaining)),
+                    not_dispatched = object()
+
+                    async def dispatch():
+                        # wait_for schedules this coroutine for another loop turn.
+                        # Recheck the absolute cutoff when dispatch really starts.
+                        dispatch_time = time.time()
+                        if (dispatch_time >= window["closes_at"]
+                                or not self.running or window["lesson_id"] != self.lesson_id
+                                or attempt in self.submission_attempts
+                                or problem_id in self.uncertain_submissions):
+                            return not_dispatched
+                        self.submission_attempts.add(attempt)
+                        return await self.client.submit_answer(
+                            problem_id, window["dt_ms"], problem["type"], solved["result"],
+                            timeout=window["closes_at"] - dispatch_time,
+                        )
+
+                    response = await asyncio.wait_for(
+                        dispatch(), timeout=max(0.0, window["closes_at"] - time.time()),
                     )
-                    code = response.get("code") if isinstance(response, dict) else "?"
-                    status = "submitted" if code == 0 else f"failed({code})"
-                    self.hub.log(f"[提交] {problem_id} {type_name} => {solved['display']} code={code}",
-                                 "info" if code == 0 else "error")
+                    if response is not_dispatched:
+                        status = "expired"
+                        self.hub.log(f"题目 {problem_id} 发起请求前窗口已关闭或已有提交，未重复发起", "warn")
+                    else:
+                        if time.time() >= window["closes_at"]:
+                            raise asyncio.TimeoutError("响应晚于题目真实截止")
+                        code = response.get("code") if isinstance(response, dict) else None
+                        if not isinstance(code, int) or isinstance(code, bool):
+                            status = "uncertain(response)"
+                            self.uncertain_submissions.add(problem_id)
+                            self.hub.log(f"题目 {problem_id} 提交结果未确认（响应缺少有效状态码），"
+                                         "未自动重发", "warn")
+                        else:
+                            status = "submitted" if code == 0 else f"failed({code})"
+                            receipt = "，服务器接收成功，未验证正确性" if code == 0 else ""
+                            self.hub.log(f"[提交] {problem_id} {type_name} => {solved['display']} code={code}{receipt}",
+                                         "info" if code == 0 else "error")
                 except core.AuthenticationExpired as exc:
                     status = "failed(auth)"
                     self._notify_issue("authorization", "雨课堂课堂授权已失效", str(exc))
                     self.hub.log(f"题目 {problem_id} 提交失败: {exc}", "error")
-                except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
-                    status = "failed(timeout)"
-                    self.hub.log(f"题目 {problem_id} 提交未在安全窗口内完成: {exc}", "error")
+                except asyncio.TimeoutError as exc:
+                    status = "uncertain(timeout)"
+                    self.uncertain_submissions.add(problem_id)
+                    self.hub.log(f"题目 {problem_id} 提交结果未确认（请求超时或已到真实截止），"
+                                 f"未自动重发: {exc}", "warn")
+                except aiohttp.ClientError as exc:
+                    status = "uncertain(network)"
+                    self.uncertain_submissions.add(problem_id)
+                    self.hub.log(f"题目 {problem_id} 提交结果未确认（网络中断），"
+                                 f"未自动重发: {exc}", "warn")
                 except Exception as exc:
-                    status = "failed(error)"
-                    self.hub.log(f"题目 {problem_id} 提交失败: {exc}", "error")
+                    status = "uncertain(error)"
+                    self.uncertain_submissions.add(problem_id)
+                    self.hub.log(f"题目 {problem_id} 提交结果未确认，未自动重发: {exc}", "warn")
             if status in ("dry", "submitted"):
                 self.answered.add(problem_id)
                 self.set_state("in_class", "课堂中，正在实时监听发题")
             await self.hub.push("problem", problem_id=problem_id, status=status,
-                                answer=solved["display"])
+                                answer=solved["display"],
+                                source="random_timeout" if random_timeout else "model")
         except asyncio.CancelledError:
             raise
         finally:
@@ -1998,7 +2369,10 @@ async def ws_handler(request):
         await ws.close(code=4001, message=b"admin session expired")
         return ws
     hub.clients.add(ws)
-    for m in list(hub.history)[-120:]:
+    history = getattr(hub, "log_history", None)
+    if history is None:
+        history = getattr(hub, "history", ())
+    for m in list(history):
         try:
             if json.loads(m).get("kind") == "log":
                 await ws.send_str(m)
@@ -2442,7 +2816,7 @@ async def api_config(request):
             update = body["llm"]
             if not isinstance(update, dict):
                 raise ValueError("llm 配置必须是 JSON 对象")
-            unknown = set(update) - {"base_url", "api_key", "model", "vision_enabled"}
+            unknown = set(update) - {"base_url", "api_key", "model", "vision_enabled", "reasoning_effort"}
             if unknown:
                 raise ValueError("llm 配置包含不支持的字段")
             base_url = update.get("base_url")
@@ -2461,6 +2835,10 @@ async def api_config(request):
             requested_vision = update.get("vision_enabled")
             if requested_vision is not None and not isinstance(requested_vision, bool):
                 raise ValueError("vision_enabled 必须是布尔值")
+            requested_effort = update.get("reasoning_effort", next_cfg["llm"].get("reasoning_effort", ""))
+            if (not isinstance(requested_effort, str)
+                    or requested_effort not in ("", "low", "medium", "high", "xhigh", "max")):
+                raise ValueError("reasoning_effort 必须为空字符串或 low/medium/high/xhigh/max")
             replacement_key = update.get("api_key", "")
             if not isinstance(replacement_key, str):
                 raise ValueError("API Key 必须是字符串")
@@ -2476,13 +2854,17 @@ async def api_config(request):
                     and core.api_key_configured(next_llm.get("api_key", ""))):
                 raise ValueError("更换模型 API 地址时必须填写对应的新 API Key")
             model_changed = model != next_llm.get("model")
+            if "reasoning_effort" not in update and (base_url_changed or model_changed):
+                requested_effort = ""
             if requested_vision is None:
-                requested_vision = (bool(next_llm.get("vision_enabled", False))
-                                    if not base_url_changed and not model_changed else False)
-            vision_changed = requested_vision != bool(next_llm.get("vision_enabled", False))
-            llm_changed = base_url_changed or model_changed or vision_changed
+                requested_vision = (bool(next_llm.get("vision_enabled", True))
+                                    if not base_url_changed and not model_changed else True)
+            vision_changed = requested_vision != bool(next_llm.get("vision_enabled", True))
+            effort_changed = requested_effort != next_llm.get("reasoning_effort", "")
+            llm_changed = base_url_changed or model_changed or vision_changed or effort_changed
             next_llm.update({"base_url": base_url, "model": model,
-                             "vision_enabled": requested_vision})
+                             "vision_enabled": requested_vision,
+                             "reasoning_effort": requested_effort})
             if replacement_key:
                 llm_changed = llm_changed or replacement_key != next_llm.get("api_key")
                 next_llm["api_key"] = replacement_key
@@ -2665,6 +3047,8 @@ async def on_cleanup(app):
             await http_session.close()
     if llm_session:
         await llm_session.close()
+    if callable(getattr(hub, "drain_logs", None)):
+        await hub.drain_logs()
 
 
 def make_app() -> web.Application:

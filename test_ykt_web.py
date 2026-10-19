@@ -44,8 +44,7 @@ def config(*, dry_run=True):
             "wait_manual_checkin": True,
             "auto_start_watching": True,
             "answer_delay_seconds": 0,
-            "safety_seconds": 8,
-            "request_margin_seconds": 0.1,
+            "request_margin_seconds": 1.5,
         },
     }
 
@@ -2147,13 +2146,13 @@ class WatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("授权已失效", subject)
         self.assertIn("HTTP 401", body)
 
-    def test_window_uses_real_start_and_safe_submit_point(self):
+    def test_window_uses_real_start_and_reserves_only_request_margin(self):
         received = 1_700_000_005.0
         window = self.watcher._question_window(1_700_000_000_000, 10, received)
         self.assertEqual(window["start"], 1_700_000_000.0)
         self.assertEqual(window["dt_ms"], 1_700_000_000_000)
         self.assertEqual(window["closes_at"], 1_700_000_010.0)
-        self.assertEqual(window["submit_by"], 1_700_000_007.5)
+        self.assertEqual(window["submit_by"], 1_700_000_008.5)
 
     def test_long_question_keeps_server_start_after_delayed_replay(self):
         received = 1_700_000_301.0
@@ -2709,8 +2708,8 @@ class PersistenceAndFrontendTests(unittest.TestCase):
         self.assertIn("body:JSON.stringify({llm})", html)
         self.assertIn('requestJSON("/api/config/llm/models"', html)
         self.assertIn("setModelOptions(result.models, previous)", html)
-        self.assertIn('if ($("llmModel").value !== previous) $("llmVision").checked = false', html)
-        self.assertIn('$("llmVision").checked = false', html)
+        self.assertIn('if ($("llmModel").value !== previous) $("llmVision").checked = true', html)
+        self.assertNotIn('$("llmVision").checked = false', html)
         self.assertIn('setModelOptions([], "")', html)
         self.assertIn("for (const control of controls) control.disabled = true", html)
         self.assertIn("if (apiKey) payload.api_key = apiKey;\n  llmFormDirty = true", html)
@@ -2825,7 +2824,7 @@ class ConfigApiTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(response.text)
 
         self.assertEqual(set(payload["llm"]), {
-            "base_url", "model", "vision_enabled", "api_key_configured",
+            "base_url", "model", "vision_enabled", "reasoning_effort", "api_key_configured",
         })
         self.assertTrue(payload["llm"]["api_key_configured"])
         self.assertFalse(payload["llm"]["vision_enabled"])
@@ -2918,6 +2917,7 @@ class ConfigApiTests(unittest.IsolatedAsyncioTestCase):
             "base_url": "https://api.example.com/v1",
             "model": "model-next",
             "vision_enabled": True,
+            "reasoning_effort": "",
             "api_key_configured": True,
         })
         self.assertNotIn("new-top-secret", response.text)

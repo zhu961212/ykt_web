@@ -4,7 +4,8 @@
     "base_url": "https://api.openai.com/v1",
     "api_key": "YOUR_API_KEY",
     "model": "YOUR_MODEL_ID",
-    "vision_enabled": false
+    "reasoning_effort": "",
+    "vision_enabled": true
   },
   "lesson": {
     "poll_interval": 3,
@@ -26,7 +27,6 @@
     "wait_manual_checkin": true,
     "auto_start_watching": false,
     "answer_delay_seconds": 5,
-    "safety_seconds": 8,
     "request_margin_seconds": 1.5
   }
 }

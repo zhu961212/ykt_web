@@ -1489,8 +1489,7 @@ if (( RUN_TESTS )); then
     log "Running offline unit tests"
     (
         cd -- "$CANDIDATE_DIR"
-        run_as_builder "$VENV_DIR/bin/python" -m unittest -q \
-            test_ykt_web.py test_email_notifier.py test_deploy_script.py
+        run_as_builder "$VENV_DIR/bin/python" -m unittest discover -q
     )
 else
     warn "Unit tests were skipped by request"

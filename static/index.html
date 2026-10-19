@@ -170,7 +170,9 @@
         <label class="field"><span>API 地址</span><input id="llmBaseUrl" type="url" maxlength="2048" spellcheck="false" required></label>
         <label class="field"><span>API Key</span><input id="llmApiKey" type="password" maxlength="8192" autocomplete="off"></label>
         <div class="field"><label for="llmModel">模型</label><div class="model-picker"><select id="llmModel" required></select><button id="btnFetchModels" type="button">获取模型</button></div></div>
-        <label class="switch"><input type="checkbox" id="llmVision"> 图片输入</label>
+        <label class="field"><span>思考强度</span><select id="llmReasoningEffort"><option value="">服务默认</option><option value="low">低（low）</option><option value="medium">中（medium）</option><option value="high">高（high）</option><option value="xhigh">更高（xhigh）</option><option value="max">最高（max）</option></select></label>
+        <div class="hint">仅在接口和模型支持时选择。较低强度通常更快，请核对准确率；服务默认不发送此参数。</div>
+        <label class="switch"><input type="checkbox" id="llmVision" checked> 图片输入</label>
         <button id="btnSaveLlm" class="primary" type="submit" style="width:100%;margin-top:10px">保存模型配置</button>
         <div id="llmHint" class="hint form-message"></div>
       </form>
@@ -227,14 +229,23 @@ let adminAuthRequired = false;
 let currentServer = "changjiang";
 let serverFormDirty = false;
 
-function addLog(text, level, accountName) {
+const seenLogIds = new Set();
+function addLog(text, level, accountName, ts, logId) {
+  if (logId && seenLogIds.has(logId)) return;
+  if (logId) {
+    seenLogIds.add(logId);
+    while (seenLogIds.size > 2000) seenLogIds.delete(seenLogIds.values().next().value);
+  }
   const log = $("log");
   const line = document.createElement("div");
   if (level) line.className = level;
   const prefix = accountName ? "[" + accountName + "] " : "";
-  line.textContent = "[" + new Date().toLocaleTimeString("zh-CN", {hour12:false}) + "] " + prefix + text;
+  const timestamp = Number(ts);
+  const date = Number.isFinite(timestamp) && timestamp >= 0 ? new Date(timestamp * 1000) : new Date();
+  const stamp = date.toLocaleString("zh-CN", {year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false});
+  line.textContent = "[" + stamp + "] " + prefix + text;
   log.appendChild(line);
-  while (log.childNodes.length > 400) log.removeChild(log.firstChild);
+  while (log.childNodes.length > 1000) log.removeChild(log.firstChild);
   log.scrollTop = log.scrollHeight;
 }
 
@@ -275,7 +286,8 @@ function applyLlmState(settings) {
     $("llmBaseUrl").value = settings.base_url || "";
     const available = llmModels.length ? llmModels : [settings.model].filter(Boolean);
     setModelOptions(available, settings.model || "");
-    $("llmVision").checked = !!settings.vision_enabled;
+    $("llmVision").checked = settings.vision_enabled !== false;
+    $("llmReasoningEffort").value = settings.reasoning_effort || "";
     keyInput.value = "";
     llmFormInitialized = true;
   }
@@ -482,7 +494,7 @@ function connectWs() {
   ws.onmessage = event => {
     let message;
     try { message = JSON.parse(event.data); } catch (error) { return; }
-    if (message.kind === "log") addLog(message.text, message.level, message.account_name);
+    if (message.kind === "log") addLog(message.text, message.level, message.account_name, message.ts, message.log_id);
     else if (message.kind === "state") applyState(message);
     else if (message.kind === "login") {
       if (message.attempt_id != null && message.attempt_id !== qrAttemptId) return;
@@ -678,24 +690,28 @@ $("autoStart").onchange = async event => {
 for (const id of ["llmBaseUrl", "llmApiKey"]) {
   $(id).oninput = () => {
     llmFormDirty = true;
-    $("llmVision").checked = false;
+    $("llmVision").checked = true;
+    $("llmReasoningEffort").value = "";
     setModelOptions([], "");
     $("llmHint").textContent = "请重新获取模型";
   };
 }
 $("llmModel").onchange = () => {
   llmFormDirty = true;
-  $("llmVision").checked = false;
+  $("llmVision").checked = true;
+  $("llmReasoningEffort").value = "";
   $("llmHint").textContent = "";
 };
-$("llmVision").onchange = () => {
-  llmFormDirty = true;
-  $("llmHint").textContent = "";
-};
+for (const id of ["llmVision", "llmReasoningEffort"]) {
+  $(id).onchange = () => {
+    llmFormDirty = true;
+    $("llmHint").textContent = "";
+  };
+}
 $("btnFetchModels").onclick = async () => {
   const button = $("btnFetchModels");
   const hint = $("llmHint");
-  const controls = [$("llmBaseUrl"), $("llmApiKey"), $("llmModel"), $("llmVision"),
+  const controls = [$("llmBaseUrl"), $("llmApiKey"), $("llmModel"), $("llmVision"), $("llmReasoningEffort"),
                     $("btnSaveLlm"), button];
   const payload = {base_url: $("llmBaseUrl").value.trim()};
   const apiKey = $("llmApiKey").value.trim();
@@ -711,7 +727,8 @@ $("btnFetchModels").onclick = async () => {
     });
     const previous = $("llmModel").value;
     setModelOptions(result.models, previous);
-    if ($("llmModel").value !== previous) $("llmVision").checked = false;
+    if ($("llmModel").value !== previous) $("llmVision").checked = true;
+    if ($("llmModel").value !== previous) $("llmReasoningEffort").value = "";
     llmFormDirty = true;
     hint.textContent = "已获取 " + result.models.length + " 个模型";
   } catch (error) {
@@ -721,6 +738,7 @@ $("btnFetchModels").onclick = async () => {
     $("llmBaseUrl").disabled = false;
     $("llmApiKey").disabled = false;
     $("llmVision").disabled = false;
+    $("llmReasoningEffort").disabled = false;
     button.disabled = false;
     $("llmModel").disabled = !llmModels.length;
     $("btnSaveLlm").disabled = !llmModels.length;
@@ -733,7 +751,8 @@ $("llmForm").onsubmit = async event => {
   const llm = {
     base_url: $("llmBaseUrl").value.trim(),
     model: $("llmModel").value.trim(),
-    vision_enabled: $("llmVision").checked
+    vision_enabled: $("llmVision").checked,
+    reasoning_effort: $("llmReasoningEffort").value
   };
   const apiKey = $("llmApiKey").value.trim();
   if (apiKey) llm.api_key = apiKey;

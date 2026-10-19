@@ -10,6 +10,7 @@ import binascii
 import html
 import json
 import re
+import secrets
 import time
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
@@ -76,14 +77,89 @@ def rsa_encrypt(plain: str) -> str:
     return base64.b64encode(key.encrypt(plain.encode(), padding.PKCS1v15())).decode()
 
 
+class _PlainTextHTMLParser(HTMLParser):
+    """Remove real markup without treating mathematical comparisons as tags."""
+
+    _structural_tags = {
+        "address", "article", "aside", "blockquote", "body", "caption", "dd", "div",
+        "dl", "dt", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2",
+        "h3", "h4", "h5", "h6", "header", "html", "li", "main", "nav", "ol", "p",
+        "pre", "section", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+    }
+    _inline_tags = {
+        "a", "abbr", "b", "bdi", "bdo", "cite", "code", "del", "dfn", "em", "font",
+        "i", "ins", "kbd", "label", "mark", "q", "s", "samp", "small", "span",
+        "strike", "strong", "sub", "sup", "time", "u", "var", "math", "mi", "mn",
+        "mo", "mrow", "mfrac", "msup", "msub", "mtext", "semantics", "annotation",
+    }
+    _void_tags = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+                  "meta", "param", "source", "track", "wbr"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.closed_tags = set()
+
+    def handle_data(self, data):
+        self.parts.append(("text", "", data))
+
+    def handle_starttag(self, tag, attrs):
+        self.parts.append(("start", tag, self.get_starttag_text()))
+
+    def handle_startendtag(self, tag, attrs):
+        self.parts.append(("self_closing", tag, self.get_starttag_text()))
+
+    def handle_endtag(self, tag):
+        self.closed_tags.add(tag)
+        self.parts.append(("end", tag, f"</{tag}>"))
+
+    def text(self):
+        parts = []
+        for kind, tag, raw in self.parts:
+            is_markup = (tag in self._structural_tags or tag in self._void_tags
+                         or (tag in self._inline_tags
+                             and (tag in self.closed_tags or kind == "self_closing")))
+            parts.append(" " if kind != "text" and is_markup else raw)
+        return "".join(parts)
+
+
 def _plain_text(value) -> str:
     if value is None:
         return ""
     if isinstance(value, (dict, list)):
         value = json.dumps(value, ensure_ascii=False)
-    value = html.unescape(str(value))
-    value = re.sub(r"<[^>]+>", " ", value)
-    return re.sub(r"\s+", " ", value).strip()
+    parser = _PlainTextHTMLParser()
+    parser.feed(str(value))
+    parser.close()
+    return re.sub(r"\s+", " ", parser.text()).strip()
+
+
+def _problem_option_entries(value: dict) -> tuple[list, str]:
+    """Return (submission key, raw option) pairs, preserving mapping keys."""
+    raw_options = value.get("options")
+    if raw_options is None or raw_options == [] or raw_options == {}:
+        raw_options = value.get("choices")
+    if raw_options is None:
+        raw_options = []
+    if isinstance(raw_options, dict):
+        entries = list(raw_options.items())
+    elif isinstance(raw_options, list):
+        entries = [(chr(ord("A") + index) if index < 26 else str(index + 1), option)
+                   for index, option in enumerate(raw_options)]
+    else:
+        return [], "题目选项格式无效：options/choices 必须是数组或对象"
+    normalized = []
+    for default_key, option in entries:
+        key = ""
+        if isinstance(option, dict):
+            for field in ("key", "index", "label"):
+                if option.get(field) is not None:
+                    key = _plain_text(option[field])
+                    if key:
+                        break
+        key = key or _plain_text(default_key)
+        normalized.append((key, option))
+    return normalized, ""
 
 
 def validate_checkin_qr_url(value: str) -> str:
@@ -408,28 +484,21 @@ def _direct_image_items(value: dict) -> list[dict]:
         items.extend({"url": source, "label": "题干图片",
                       "kind": "stem_image", "priority": 5}
                      for source in _html_image_sources(value.get(key)))
-    raw_options = value.get("options") or value.get("choices") or []
-    if isinstance(raw_options, dict):
-        raw_options = list(raw_options.values())
-    if isinstance(raw_options, list):
-        for index, option in enumerate(raw_options):
-            default_key = chr(ord("A") + index) if index < 26 else str(index + 1)
-            if isinstance(option, dict):
-                option_key = _plain_text(
-                    option.get("key") or option.get("index") or option.get("label")
-                ) or default_key
-                for key in ("value", "content", "text"):
-                    items.extend({"url": source, "label": f"选项 {option_key} 图片",
-                                  "kind": "option_image", "priority": 0}
-                                 for source in _image_value_sources(option.get(key)))
-                for key in ("images", "image", "imageUrl", "image_url", "pictures", "pics"):
-                    items.extend({"url": source, "label": f"选项 {option_key} 图片",
-                                  "kind": "option_image", "priority": 0}
-                                 for source in _image_value_sources(option.get(key)))
-            else:
-                items.extend({"url": source, "label": f"选项 {default_key} 图片",
+    option_entries, _ = _problem_option_entries(value)
+    for option_key, option in option_entries:
+        if isinstance(option, dict):
+            for key in ("value", "content", "text"):
+                items.extend({"url": source, "label": f"选项 {option_key} 图片",
                               "kind": "option_image", "priority": 0}
-                             for source in _image_value_sources(option))
+                             for source in _image_value_sources(option.get(key)))
+            for key in ("images", "image", "imageUrl", "image_url", "pictures", "pics"):
+                items.extend({"url": source, "label": f"选项 {option_key} 图片",
+                              "kind": "option_image", "priority": 0}
+                             for source in _image_value_sources(option.get(key)))
+        else:
+            items.extend({"url": source, "label": f"选项 {option_key} 图片",
+                          "kind": "option_image", "priority": 0}
+                         for source in _image_value_sources(option))
     return _merge_image_items(items)
 
 
@@ -450,23 +519,20 @@ def _problem_needs_slide_cover(problem: dict, image_items=()) -> bool:
         )
     except (TypeError, ValueError):
         problem_type = 0
-    raw_options = problem.get("options") or problem.get("choices") or []
-    if isinstance(raw_options, dict):
-        raw_options = list(raw_options.values())
-    if problem_type in (1, 2, 3, 6) and not raw_options:
+    option_entries, option_error = _problem_option_entries(problem)
+    if option_error or (problem_type in (1, 2, 3, 6) and not option_entries):
         return True
     option_texts = []
-    if isinstance(raw_options, list):
-        for option in raw_options:
-            if isinstance(option, dict):
-                text = _plain_text(
-                    option.get("value") or option.get("content") or option.get("text")
-                )
-            else:
-                text = _plain_text(option)
-            if problem_type in (1, 2, 3, 6) and not text:
-                return True
-            option_texts.append(text)
+    for _, option in option_entries:
+        if isinstance(option, dict):
+            text = _plain_text(
+                option.get("value") or option.get("content") or option.get("text")
+            )
+        else:
+            text = _plain_text(option)
+        if problem_type in (1, 2, 3, 6) and not text:
+            return True
+        option_texts.append(text)
     if any(item.get("kind") == "slide_cover" and item.get("text_only_shapes")
            for item in image_items if isinstance(item, dict)):
         return False
@@ -523,17 +589,13 @@ def extract_problems(presentation_data: dict) -> dict:
         except (TypeError, ValueError):
             ptype = 0
         title = _plain_text(p.get("body") or p.get("title") or p.get("content") or p.get("stem"))
-        raw_options = p.get("options") or p.get("choices") or []
-        if isinstance(raw_options, dict):
-            raw_options = list(raw_options.values())
+        option_entries, option_error = _problem_option_entries(p)
         options = []
-        for index, option in enumerate(raw_options):
-            default_key = chr(ord("A") + index) if index < 26 else str(index + 1)
+        for key, option in option_entries:
             if isinstance(option, dict):
-                key = _plain_text(option.get("key") or option.get("index") or option.get("label")) or default_key
                 val = _plain_text(option.get("value") or option.get("content") or option.get("text"))
             else:
-                key, val = default_key, _plain_text(option)
+                val = _plain_text(option)
             options.append((key, val))
         if not _problem_needs_slide_cover(p, candidate_image_items):
             candidate_image_items = [
@@ -551,10 +613,14 @@ def extract_problems(presentation_data: dict) -> dict:
             "dt": p.get("dt") or 0,
             "raw": p,
         }
+        if option_error:
+            problems[pid]["parse_error"] = option_error
     return problems
 
 
 SYSTEM_PROMPT = ("你是大学课堂随堂测答题助手。你会收到一道题目，必须只输出一个严格的 JSON 对象，"
+                 "作答前核对概念定义、正负号、单位和上下标，不要混用名称相近或定义约定不同的量。"
+                 "图题以附图中的坐标、曲线和选项标签为准，不要根据图片顺序重新编号。"
                  "不要输出任何解释、markdown 代码块标记或其他文字。")
 
 TYPE_INSTRUCTION = {
@@ -576,6 +642,8 @@ def build_prompt(prob: dict) -> str:
              TYPE_INSTRUCTION.get(prob["type"], '输出 {"answers": [...]}'),
              f"题干：{prob['title']}"]
     if prob["options"]:
+        if prob["type"] in (1, 2, 3, 6):
+            lines.append("答案必须原样使用下面的选项标识，不要按位置重新编号。")
         lines.append("选项：")
         for k, v in prob["options"]:
             lines.append(f"  {k}. {v}")
@@ -780,6 +848,8 @@ def _validate_choice_answers(prob: dict, answers: list[str]) -> list[str]:
 
 
 def _validate_llm_result(prob: dict, parsed: dict) -> dict:
+    if prob.get("parse_error"):
+        raise ValueError(str(prob["parse_error"]))
     problem_type = prob.get("type")
     if problem_type not in TYPE_INSTRUCTION:
         raise ValueError(f"不支持的题型: {problem_type}")
@@ -807,6 +877,36 @@ def _validate_llm_result(prob: dict, parsed: dict) -> dict:
                 f"填空题答案数量不匹配: 题目有 {blank_count} 个空，模型返回 {len(answers)} 个答案"
             )
     return {"result": answers, "display": json.dumps(answers, ensure_ascii=False)}
+
+
+def random_choice_result(prob: dict):
+    """Choose a valid random response for a timed-out choice question only."""
+    if (not isinstance(prob, dict) or prob.get("parse_error")
+            or prob.get("type") not in (1, 2, 3, 6)):
+        return None
+    options = prob.get("options")
+    if not isinstance(options, list) or not options:
+        return None
+    keys = []
+    for option in options:
+        if (not isinstance(option, (list, tuple)) or len(option) < 2
+                or not isinstance(option[0], str) or not option[0].strip()):
+            return None
+        keys.append(option[0].strip())
+    # Check every key (including case-insensitive duplicates) before drawing.
+    try:
+        _validate_llm_result(prob, {"answers": [keys[0]]})
+    except ValueError:
+        return None
+    if prob["type"] == 2:
+        # Every nonempty subset has an equal chance; retain the original order.
+        mask = secrets.randbelow((1 << len(keys)) - 1) + 1
+        selected = [key for index, key in enumerate(keys) if mask & (1 << index)]
+    else:
+        selected = [secrets.choice(keys)]
+    result = _validate_llm_result(prob, {"answers": selected})
+    result["source"] = "random_timeout"
+    return result
 
 
 class LLMSolver:
@@ -959,6 +1059,8 @@ class LLMSolver:
 
     async def solve(self, prob: dict) -> dict:
         """返回 {'result': result 字段值, 'display': 日志字符串}"""
+        if prob.get("parse_error"):
+            raise ValueError(str(prob["parse_error"]))
         problem_type = prob.get("type")
         if problem_type not in TYPE_INSTRUCTION:
             raise ValueError(f"不支持的题型: {problem_type}")
@@ -969,7 +1071,7 @@ class LLMSolver:
         model = str(settings.get("model") or "").strip()
         if not model:
             raise RuntimeError("LLM 模型未配置")
-        if _problem_image_items(prob) and not settings.get("vision_enabled", False):
+        if _problem_image_items(prob) and not settings.get("vision_enabled", True):
             raise RuntimeError("当前模型尚未确认支持图片输入")
         base = chat_completions_url(settings.get("base_url", ""))
         original_user_content = build_user_content(prob)
@@ -986,6 +1088,9 @@ class LLMSolver:
                 {"role": "user", "content": user_content},
             ],
         }
+        reasoning_effort = settings.get("reasoning_effort", "")
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
         headers = {"authorization": f"Bearer {api_key}", "content-type": "application/json"}
         async with self.http.post(base, json=payload, headers=headers,
                                   timeout=aiohttp.ClientTimeout(total=45)) as r:
